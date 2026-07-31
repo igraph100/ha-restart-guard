@@ -484,19 +484,30 @@
    * wave a core update through behind it, which is how one slipped past.
    */
   const BYPASS_MS = 15000;
+  // a silent pass-through only has to survive the hop to the next layer, which
+  // takes about half a second - it should not linger like a real approval
+  const HANDOFF_MS = 5000;
   let bypass = { until: 0, key: null };
-  const allowOnce = (action) => {
-    bypass = { until: Date.now() + BYPASS_MS, key: (action && action.key) || "restart" };
+  const allowOnce = (action, ms) => {
+    bypass = {
+      until: Date.now() + (ms || BYPASS_MS),
+      key: (action && action.key) || "restart",
+    };
   };
   const bypassed = (action) =>
     Date.now() < bypass.until && !!action && bypass.key === action.key;
 
-  const CORE_UPDATE_ID = /^update\.home_assistant_(core|operating_system|supervisor)_update$/;
-  const CORE_UPDATE_TITLES = [
-    "home assistant core",
-    "home assistant operating system",
-    "home assistant supervisor",
-  ];
+  /*
+   * Updates that restart something when they finish. The Operating System is
+   * deliberately NOT one of them: installing it only stages the new image and
+   * raises a "system reboot required" repair, leaving Home Assistant running.
+   * That reboot is guarded in its own right, so warning at install time would
+   * be warning about an action that cannot interrupt anything - and teaching
+   * you to click through the prompt that does matter. Verified on HA OS 18.2:
+   * the update entity went to 18.2 while Supervisor still reported 18.1.
+   */
+  const CORE_UPDATE_ID = /^update\.home_assistant_(core|supervisor)_update$/;
+  const CORE_UPDATE_TITLES = ["home assistant core", "home assistant supervisor"];
 
   function asArray(value) {
     if (value == null) return [];
@@ -559,10 +570,13 @@
     } else {
       return null;
     }
-    if (path === "/core/restart") return ACTIONS.restart;
-    if (path === "/host/reboot") return ACTIONS.reboot;
-    if (path === "/host/shutdown" || path === "/core/stop") return ACTIONS.shutdown;
-    if (/^\/(core|os|supervisor)\/update$/.test(path)) return ACTIONS.update;
+    // match on the leading path, not the whole string: these endpoints take a
+    // trailing version or sub-path often enough that an exact compare misses
+    if (/^\/core\/restart(\/|$)/.test(path)) return ACTIONS.restart;
+    if (/^\/host\/reboot(\/|$)/.test(path)) return ACTIONS.reboot;
+    if (/^\/(host\/shutdown|core\/stop)(\/|$)/.test(path)) return ACTIONS.shutdown;
+    // /os/update stages the image and reboots nothing - see CORE_UPDATE_ID
+    if (/^\/(core|supervisor)\/update(\/|$)/.test(path)) return ACTIONS.update;
     return null;
   }
 
@@ -573,17 +587,134 @@
    * remember which flows came from a restart-flavoured issue and ask then.
    */
   const restartFlows = new Set();
+  const RESTARTY = /restart|reboot/i;
 
-  function noteFixFlow(path, parameters, result) {
-    if (!/^repairs\/issues\/fix\/?$/.test(String(path || ""))) return;
+  /*
+   * What kind of issue this fix flow is for. Most repairs say it in the
+   * issue_id ("restart_required_..."), but Supervisor-reported ones are
+   * identified by a bare uuid - including "settings were changed which require
+   * a system reboot" - so the id alone silently misses them. When the id says
+   * nothing, ask the repairs list what the issue actually is.
+   */
+  async function issueIsRestarty(parameters) {
     const issue = parameters && (parameters.issue_id || parameters.issue);
-    const flowId = result && result.flow_id;
-    if (flowId && typeof issue === "string" && /restart|reboot/i.test(issue)) {
-      restartFlows.add(flowId);
-      if (restartFlows.size > 32) {
-        restartFlows.delete(restartFlows.values().next().value);
-      }
+    if (typeof issue === "string" && RESTARTY.test(issue)) return true;
+    try {
+      const hass = root() && root().hass;
+      if (!hass || !hass.connection) return false;
+      const listed = await hass.connection.sendMessagePromise({
+        type: "repairs/list_issues",
+      });
+      const match = (listed.issues || []).find(
+        (row) =>
+          row.issue_id === issue &&
+          (!parameters.handler || row.domain === parameters.handler)
+      );
+      if (!match) return false;
+      return RESTARTY.test(
+        [match.translation_key, match.issue_domain, match.issue_id]
+          .filter(Boolean)
+          .join(" ")
+      );
+    } catch (err) {
+      return false; // never let a lookup failure block a repair
     }
+  }
+
+  const BANNER_CLASS = "rg-banner";
+  // the banner currently on screen, if any: the notice checks this so the two
+  // never say the same thing one after the other
+  let liveBanner = null;
+
+  /*
+   * Home Assistant's own restart dialog carries the guard's verdict the moment
+   * you open it. A restart-required repair did not - it only spoke up once you
+   * pressed Submit, which is after the decision you wanted help with. This puts
+   * the same read-only verdict in the repair dialog as it opens. No buttons:
+   * it informs, and Submit still does the actual gating.
+   */
+  function showRepairBanner() {
+    let tries = 0;
+    const attach = () => {
+      const host = openModalHost();
+      if (!host) {
+        if (++tries < 24) setTimeout(attach, 150); // dialog still rendering
+        return;
+      }
+      if (host.querySelector("." + BANNER_CLASS)) return; // already announced
+      // a prompt already took the floor in this dialog: nothing to add
+      if (host.querySelector(".rg-card")) return;
+      try {
+        modalStyle();
+        const card = document.createElement("div");
+        const scoped = document.createElement("style");
+        scoped.textContent = MODAL_CSS;
+        const alert = customElements.get("ha-alert")
+          ? document.createElement("ha-alert")
+          : null;
+        if (alert) alert.className = "rg-alert";
+        const head = document.createElement("div");
+        head.className = "rg-head";
+        const body = document.createElement("div");
+        body.className = "rg-body";
+        card.append(scoped, ...(alert ? [alert] : [head, body]));
+
+        let timer = null;
+        const stop = () => {
+          if (timer) clearInterval(timer);
+          if (liveBanner === card) liveBanner = null;
+          card.remove();
+        };
+        const paint = () => {
+          if (!card.isConnected || !host.open) return stop();
+          const view = describeState(guardInfo(), false);
+          if (!view) return stop();
+          card.className =
+            "rg-card rg-inline " + BANNER_CLASS + " " + view.type +
+            (alert ? " rg-hasalert" : "");
+          if (alert) {
+            alert.setAttribute("alert-type", view.type);
+            alert.setAttribute("title", view.title);
+            alert.innerHTML = view.body;
+          } else {
+            head.textContent = view.title;
+            body.innerHTML = view.body;
+          }
+        };
+
+        host.prepend(card);
+        liveBanner = card;
+        paint();
+        host.addEventListener("close", stop);
+        // same timing rule as everything else here: ha-alert has not rendered
+        // on this tick, so judge whether it landed a couple of frames later
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            if (!card.isConnected) return;
+            const rect = card.getBoundingClientRect();
+            // a banner is only ever informational: if the dialog gives it no
+            // room, drop it rather than floating it loose on the page
+            if (rect.height < 20 || rect.width < 40) stop();
+          })
+        );
+        timer = setInterval(paint, TICK_MS);
+      } catch (err) {
+        /* a banner is never worth breaking a repair over */
+      }
+    };
+    attach();
+  }
+
+  async function noteFixFlow(path, parameters, result) {
+    if (!/^repairs\/issues\/fix\/?$/.test(String(path || ""))) return;
+    const flowId = result && result.flow_id;
+    if (!flowId) return;
+    if (!(await issueIsRestarty(parameters || {}))) return;
+    restartFlows.add(flowId);
+    if (restartFlows.size > 32) {
+      restartFlows.delete(restartFlows.values().next().value);
+    }
+    showRepairBanner(); // say it now, not after they commit
   }
 
   function classifyApi(method, path) {
@@ -786,6 +917,9 @@
         return;
       }
       for (const dialog of dialogs) {
+        // never treat one of our own dialogs as a host: a prompt would nest
+        // inside the previous prompt, and a banner would land in one too
+        if (dialog.classList && dialog.classList.contains("rg-modal")) continue;
         const modal = dialog.matches ? dialog.matches(":modal") : dialog.open;
         if (dialog.open && modal) found.push(dialog);
       }
@@ -896,9 +1030,14 @@
       const actions = document.createElement("div");
       actions.className = "rg-actions";
       const cancel = document.createElement("button");
+      // type matters: a button defaults to submit, and inline these live inside
+      // Home Assistant's own dialog - often inside its <form> - where a submit
+      // would post that form or close the dialog out from under us
+      cancel.type = "button";
       cancel.className = "rg-btn";
       cancel.textContent = "Cancel";
       const go = document.createElement("button");
+      go.type = "button";
       go.className = "rg-btn danger";
       go.textContent = action.confirm;
       actions.append(cancel, go);
@@ -1032,12 +1171,23 @@
         });
         // place first, then paint: paint() reads whether the card is still in
         // the document, and an unplaced card looks exactly like a closed host
+        // the banner has said its piece; the prompt takes over from here
+        const banner = host.querySelector("." + BANNER_CLASS);
+        if (banner) banner.remove();
         host.prepend(card);
         paint();
-        if (!done && !landed()) {
-          card.remove();
-          standAlone();
-        }
+        // Same timing trap as the note: when ha-alert carries the content, all
+        // that measures on this tick is the button row - under the threshold -
+        // so an immediate check would throw the card out of a dialog that was
+        // hosting it perfectly well. Let it render, then judge.
+        const settle = () => {
+          if (done || !card.isConnected || overlay) return;
+          if (!landed()) {
+            card.remove();
+            standAlone();
+          }
+        };
+        requestAnimationFrame(() => requestAnimationFrame(settle));
       } else {
         standAlone();
       }
@@ -1055,8 +1205,17 @@
    * Goes inside an open dialog when there is one, for the same top-layer
    * reason the confirm box does.
    */
+  let lastNotice = { text: "", at: 0 };
+
   function notice(text) {
     if (!SHOW_ALLOWED_NOTICE) return;
+    // a banner is already showing this verdict, in the dialog being looked at:
+    // a second green box underneath it says nothing new
+    if (liveBanner && liveBanner.isConnected) return;
+    // belt and braces: whatever else goes wrong, never say the same thing twice
+    const at = Date.now();
+    if (text === lastNotice.text && at - lastNotice.at < 3000) return;
+    lastNotice = { text: text, at: at };
     try {
       modalStyle();
       const host = openModalHost();
@@ -1081,6 +1240,21 @@
         el.appendChild(label);
       }
       (host || document.body).prepend(el);
+      // A host dialog can leave it with no room, exactly as it can the card,
+      // and a note nobody can see is the same as no note at all. Measure a
+      // couple of frames later, though: ha-alert has not rendered on this tick,
+      // so an immediate read is zero and would evict a perfectly good note.
+      if (host) {
+        const settle = () => {
+          if (!el.isConnected) return;
+          const rect = el.getBoundingClientRect();
+          if (rect.height < 8 || rect.width < 20 || rect.bottom <= 0) {
+            el.classList.remove("rg-inline");
+            document.body.prepend(el);
+          }
+        };
+        requestAnimationFrame(() => requestAnimationFrame(settle));
+      }
       setTimeout(() => el.remove(), 4000);
     } catch (err) {
       /* a note is never worth breaking a restart over */
@@ -1096,6 +1270,7 @@
     let info = guardInfo();
     if (!info || info.missing) {
       notice("Restart Guard: no sensor to check — going ahead");
+      allowOnce(action, HANDOFF_MS); // decided: the layer below must not re-ask
       return true; // no sensor: never in the way
     }
 
@@ -1114,6 +1289,7 @@
     info = guardInfo();
     if (!info || info.missing) {
       notice("Restart Guard: no sensor to check — going ahead");
+      allowOnce(action, HANDOFF_MS);
       return true;
     }
     if (!info.warn) {
@@ -1122,6 +1298,9 @@
           ? `Restart Guard: nothing at risk — next run ${relative(info.mins)}`
           : `Restart Guard: nothing scheduled ${horizon(info.lookahead)} — going ahead`
       );
+      // One action is one decision. Without this the same restart is judged
+      // again on its way down to the websocket, and says so a second time.
+      allowOnce(action, HANDOFF_MS);
       return true;
     }
     return showConfirm(action);
@@ -1185,7 +1364,7 @@
           }
           const result = await original(method, path, parameters, ...rest);
           try {
-            noteFixFlow(path, parameters, result);
+            await noteFixFlow(path, parameters, result);
           } catch (err) {
             /* never let bookkeeping break a real call */
           }
@@ -1353,5 +1532,5 @@
 
   attach();
   window.__restartGuardLoaded = true; // handy marker when debugging in DevTools
-  window.__restartGuardBuild = "0.3.0"; // which build the browser actually has
+  window.__restartGuardBuild = "0.0.2"; // which build the browser actually has
 })();
