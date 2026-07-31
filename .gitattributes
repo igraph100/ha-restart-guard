@@ -1,0 +1,7 @@
+# Store everything with LF in the repository, whatever the checkout looks like.
+# The release workflow uses a shell heredoc (<<'PY'); a stray CR on the closing
+# marker would stop it terminating and the release build would never finish.
+* text=auto eol=lf
+
+# Never touch the brand images.
+*.png binary

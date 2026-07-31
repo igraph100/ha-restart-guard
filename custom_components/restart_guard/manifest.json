@@ -1,0 +1,21 @@
+{
+  "domain": "restart_guard",
+  "name": "Restart Guard",
+  "after_dependencies": [
+    "automation",
+    "sun"
+  ],
+  "codeowners": [
+    "@igraph100"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "frontend",
+    "http"
+  ],
+  "documentation": "https://github.com/igraph100/ha-restart-guard",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/igraph100/ha-restart-guard/issues",
+  "version": "0.0.1"
+}

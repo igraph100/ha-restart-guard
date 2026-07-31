@@ -1,0 +1,53 @@
+{
+  "title": "Restart Guard",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Restart Guard",
+        "description": "Warns you in Home Assistant's own restart dialog when a timed automation is about to run.",
+        "data": {
+          "warn_window": "Warn if an automation is due within",
+          "lookahead": "Look ahead at most",
+          "min_interval": "Ignore automations repeating more often than",
+          "stale_run": "Stop blocking on a run still going after",
+          "check_conditions": "Stay quiet when conditions can't pass",
+          "track_schedules": "Also watch Scheduler schedules"
+        },
+        "data_description": {
+          "warn_window": "How close counts as too close to restart.",
+          "lookahead": "Automations further out than this are not tracked.",
+          "min_interval": "Stops every-5-minutes automations from warning constantly.",
+          "stale_run": "An automation part-way through a run always warns you, because restarting cuts it off. But one still going after this long is probably parked in a wait_for_trigger, so it is listed without requiring the second tap.",
+          "check_conditions": "Don't warn about an automation that would fire and do nothing, because its conditions don't pass or no choose branch matches. Turn this off to warn about every scheduled run regardless.",
+          "track_schedules": "Include schedules from the Scheduler component (nielsfaber). Only enabled schedules count - a disabled one keeps publishing a next trigger time it will never act on."
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Restart Guard is already set up."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Restart Guard options",
+        "data": {
+          "warn_window": "Warn if an automation is due within",
+          "lookahead": "Look ahead at most",
+          "min_interval": "Ignore automations repeating more often than",
+          "stale_run": "Stop blocking on a run still going after",
+          "check_conditions": "Stay quiet when conditions can't pass",
+          "track_schedules": "Also watch Scheduler schedules"
+        },
+        "data_description": {
+          "warn_window": "How close counts as too close to restart.",
+          "lookahead": "Automations further out than this are not tracked.",
+          "min_interval": "Stops every-5-minutes automations from warning constantly.",
+          "stale_run": "An automation part-way through a run always warns you, because restarting cuts it off. But one still going after this long is probably parked in a wait_for_trigger, so it is listed without requiring the second tap.",
+          "check_conditions": "Don't warn about an automation that would fire and do nothing, because its conditions don't pass or no choose branch matches. Turn this off to warn about every scheduled run regardless.",
+          "track_schedules": "Include schedules from the Scheduler component (nielsfaber). Only enabled schedules count - a disabled one keeps publishing a next trigger time it will never act on."
+        }
+      }
+    }
+  }
+}

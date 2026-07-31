@@ -1,0 +1,433 @@
+"""Work out when each automation is next due to fire.
+
+Deliberately free of Home Assistant imports so it can be unit tested on its
+own. Everything Home Assistant knows about the outside world (entity states,
+sun times) arrives through the two callables passed into :func:`compute`.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable
+
+_LOGGER = logging.getLogger(__name__)
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+SUN_EVENTS = ("sunrise", "sunset")
+
+ResolveEntity = Callable[[str], "dt.time | dt.datetime | None"]
+SunNext = Callable[[str, int], "dt.datetime | None"]
+
+
+@dataclass
+class AutomationInfo:
+    """What we need to know about one automation."""
+
+    entity_id: str
+    name: str
+    triggers: list[dict[str, Any]] = field(default_factory=list)
+    weekdays: set[str] | None = None
+    # (after, before) from a `condition: time`, when it pins the run to a
+    # window. A minute-by-minute trigger fenced into 20 minutes a week is not
+    # the noisy automation the min-interval filter exists to suppress.
+    window: tuple[dt.time, dt.time] | None = None
+
+
+# --------------------------------------------------------------------------
+# small parsers
+# --------------------------------------------------------------------------
+def trigger_kind(trigger: Any) -> str | None:
+    """New syntax uses `trigger:`, pre-2024.10 syntax used `platform:`."""
+    if not isinstance(trigger, dict):
+        return None
+    kind = trigger.get("trigger") or trigger.get("platform")
+    return str(kind) if kind else None
+
+
+def trigger_field(trigger: Any, name: str) -> Any:
+    """A trigger's field, wherever the validated config happens to keep it.
+
+    Home Assistant does not guarantee that a validated trigger is flat. A sun
+    trigger came back as `{"trigger": "sun", ...}` with `event` and `offset`
+    nested a level down, which made every sun trigger look eventless and got
+    them all dropped without a word. Reading by name instead of by position
+    survives that, and survives it moving again.
+    """
+    if not isinstance(trigger, dict):
+        return None
+    if trigger.get(name) is not None:
+        return trigger[name]
+    for value in trigger.values():
+        if isinstance(value, dict) and value.get(name) is not None:
+            return value[name]
+    for value in trigger.values():
+        if isinstance(value, dict):
+            found = trigger_field(value, name)
+            if found is not None:
+                return found
+    return None
+
+
+def as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def parse_clock(value: Any) -> dt.time | None:
+    """'07:00:00' / '7:00' / time -> time. Entity ids return None."""
+    if isinstance(value, dt.time):
+        return value
+    if isinstance(value, dt.datetime):
+        return value.timetz() if value.tzinfo else value.time()
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or "." in text or text[0].isalpha():
+        return None
+    bits = text.split(":")
+    try:
+        hour = int(bits[0])
+        minute = int(bits[1]) if len(bits) > 1 else 0
+        second = int(float(bits[2])) if len(bits) > 2 else 0
+    except (ValueError, IndexError):
+        return None
+    if not (0 <= hour < 24 and 0 <= minute < 60 and 0 <= second < 60):
+        return None
+    return dt.time(hour, minute, second)
+
+
+def is_entity_id(value: Any) -> bool:
+    return isinstance(value, str) and "." in value and value[0].isalpha()
+
+
+def parse_offset(value: Any) -> int:
+    """'-00:30:00' / '00:15' / 900 / timedelta -> seconds."""
+    if value in (None, ""):
+        return 0
+    if isinstance(value, dt.timedelta):
+        return int(value.total_seconds())
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    sign = -1 if text.startswith("-") else 1
+    bits = text.lstrip("+-").split(":")
+    try:
+        nums = [float(bit or 0) for bit in bits]
+    except ValueError:
+        return 0
+    while len(nums) < 3:
+        nums.append(0.0)
+    return sign * int(nums[0] * 3600 + nums[1] * 60 + nums[2])
+
+
+def weekdays_from(obj: Any) -> set[str] | None:
+    if not isinstance(obj, dict):
+        return None
+    days = obj.get("weekday")
+    if not days:
+        return None
+    parsed = {str(day).lower()[:3] for day in as_list(days)}
+    parsed &= set(WEEKDAYS)
+    return parsed or None
+
+
+def weekdays_from_conditions(config: Any) -> set[str] | None:
+    """Weekday limits declared in the automation's own conditions."""
+    if not isinstance(config, dict):
+        return None
+    result: set[str] | None = None
+    for cond in as_list(config.get("conditions") or config.get("condition")):
+        if isinstance(cond, dict) and cond.get("condition") == "time":
+            days = weekdays_from(cond)
+            if days:
+                result = days if result is None else (result & days)
+    return result
+
+
+def time_window_from_conditions(config: Any) -> tuple[dt.time, dt.time] | None:
+    """The (after, before) window a `condition: time` pins the run to.
+
+    Entity-based bounds (`after: input_datetime.x`) are skipped: they cannot be
+    resolved here, and guessing a window would be worse than having none.
+    """
+    if not isinstance(config, dict):
+        return None
+    for cond in as_list(config.get("conditions") or config.get("condition")):
+        if not isinstance(cond, dict) or cond.get("condition") != "time":
+            continue
+        after = parse_clock(cond.get("after"))
+        before = parse_clock(cond.get("before"))
+        if after is not None and before is not None:
+            return (after, before)
+    return None
+
+
+def in_window(moment: dt.datetime, window: tuple[dt.time, dt.time] | None) -> bool:
+    """Home Assistant's own after/before semantics, wrapping midnight included."""
+    if window is None:
+        return True
+    after, before = window
+    clock = moment.time()
+    if after < before:
+        return after <= clock < before
+    return clock >= after or clock < before
+
+
+def sun_slots(
+    base: dt.datetime, offset: int, now: dt.datetime
+) -> list[dt.datetime]:
+    """Candidate fire times around a published sun event, soonest first.
+
+    ``base`` is the next sunrise/sunset Home Assistant publishes, so it is
+    always in the future. That alone is not enough to work out when a sun
+    trigger fires:
+
+    * a negative offset pulls the run back, possibly to before ``now`` - the
+      real next run is then a day later;
+    * a positive offset applied to *tomorrow's* event hides one still due
+      today, because today's event has passed but today's event *plus* the
+      offset has not.
+
+    So a span of days either side is considered and the earliest one still
+    ahead of us wins. The span grows with the offset: a twelve-hour offset can
+    push a run clean past the neighbouring day, so looking only one day out
+    would find nothing at all and read as "nothing due". A sun event moves by
+    about a minute per day, which is far finer than anything here needs.
+    """
+    shift = dt.timedelta(seconds=offset)
+    span = abs(offset) // 86400 + 2
+    candidates = [
+        base + dt.timedelta(days=day) + shift
+        for day in range(-span, span + 1)
+    ]
+    return sorted(moment for moment in candidates if moment > now)
+
+
+def pattern_hit(value: int, spec: Any) -> bool:
+    if spec in (None, "*", "**"):
+        return True
+    text = str(spec).strip()
+    if text.startswith("/"):
+        try:
+            step = int(text[1:])
+        except ValueError:
+            return False
+        return step > 0 and value % step == 0
+    try:
+        return value == int(text)
+    except ValueError:
+        return False
+
+
+def is_enabled(obj: Any) -> bool:
+    return not (isinstance(obj, dict) and obj.get("enabled") is False)
+
+
+# --------------------------------------------------------------------------
+# occurrence maths
+# --------------------------------------------------------------------------
+def _combine(day: dt.date, clock: dt.time, tz: dt.tzinfo) -> dt.datetime:
+    """Wall-clock time on a given day, DST-correct via zoneinfo."""
+    return dt.datetime.combine(day, clock.replace(tzinfo=None), tzinfo=tz)
+
+
+def clock_occurrences(
+    clock: dt.time, now: dt.datetime, tz: dt.tzinfo, weekdays: set[str] | None
+) -> list[dt.datetime]:
+    found = []
+    for shift in (0, 1, 2):
+        day = (now + dt.timedelta(days=shift)).date()
+        if weekdays and WEEKDAYS[day.weekday()] not in weekdays:
+            continue
+        found.append(_combine(day, clock, tz))
+    return found
+
+
+def pattern_occurrences(
+    trigger: dict[str, Any],
+    now: dt.datetime,
+    lookahead: int,
+    weekdays: set[str] | None,
+    min_interval: int,
+    window: tuple[dt.time, dt.time] | None = None,
+) -> list[dt.datetime]:
+    """time_pattern matches inside the lookahead window.
+
+    Patterns that fire more often than ``min_interval`` minutes are ignored:
+    warning about an every-5-minutes automation is just noise.
+    """
+    hours, minutes, seconds = (
+        trigger_field(trigger, "hours"),
+        trigger_field(trigger, "minutes"),
+        trigger_field(trigger, "seconds"),
+    )
+    if hours is None and minutes is None and seconds is None:
+        return []
+    if not pattern_hit(0, seconds):
+        return []  # only fires on non-zero seconds, never restart-critical
+
+    # How often does it *actually* act? A `minutes: "*"` pattern fenced by a
+    # `condition: time` into a 20-minute window is not the every-minute nuisance
+    # this filter exists to suppress, so only count hits the window allows.
+    per_day = 0
+    base = now.replace(second=0, microsecond=0)
+    for step in range(1440):
+        moment = base + dt.timedelta(minutes=step)
+        if not (pattern_hit(moment.hour, hours) and pattern_hit(moment.minute, minutes)):
+            continue
+        if not in_window(moment, window):
+            continue
+        per_day += 1
+    if per_day and (1440.0 / per_day) < min_interval:
+        return []
+
+    found = []
+    for step in range(1, lookahead + 2):
+        moment = base + dt.timedelta(minutes=step)
+        if not pattern_hit(moment.hour, hours):
+            continue
+        if not pattern_hit(moment.minute, minutes):
+            continue
+        if weekdays and WEEKDAYS[moment.weekday()] not in weekdays:
+            continue
+        found.append(moment)
+    return found
+
+
+def _resolved_slots(
+    value: Any,
+    offset: int,
+    now: dt.datetime,
+    tz: dt.tzinfo,
+    weekdays: set[str] | None,
+    resolve_entity: ResolveEntity,
+) -> list[dt.datetime]:
+    """Turn one `at:` value into candidate datetimes."""
+    clock = parse_clock(value)
+    if clock is not None:
+        slots = clock_occurrences(clock, now, tz, weekdays)
+    elif is_entity_id(value):
+        resolved = resolve_entity(value)
+        if resolved is None:
+            return []
+        if isinstance(resolved, dt.datetime):
+            slots = [resolved if resolved.tzinfo else resolved.replace(tzinfo=tz)]
+        else:
+            slots = clock_occurrences(resolved, now, tz, weekdays)
+    else:
+        return []
+    if offset:
+        slots = [slot + dt.timedelta(seconds=offset) for slot in slots]
+    return slots
+
+
+def trigger_slots(
+    trigger: dict[str, Any],
+    now: dt.datetime,
+    tz: dt.tzinfo,
+    lookahead: int,
+    weekdays: set[str] | None,
+    resolve_entity: ResolveEntity,
+    sun_next: SunNext,
+    min_interval: int,
+    window: tuple[dt.time, dt.time] | None = None,
+) -> list[dt.datetime]:
+    """Candidate fire times for a single trigger."""
+    kind = trigger_kind(trigger)
+
+    if kind == "time":
+        slots: list[dt.datetime] = []
+        for at in as_list(trigger_field(trigger, "at")):
+            if isinstance(at, dict):
+                slots += _resolved_slots(
+                    at.get("entity_id") or at.get("at"),
+                    parse_offset(at.get("offset")),
+                    now, tz, weekdays, resolve_entity,
+                )
+            else:
+                slots += _resolved_slots(at, 0, now, tz, weekdays, resolve_entity)
+        return slots
+
+    if kind == "time_pattern":
+        return pattern_occurrences(
+            trigger, now, lookahead, weekdays, min_interval, window
+        )
+
+    if kind == "sun":
+        event = str(trigger_field(trigger, "event") or "").lower()
+        if event not in SUN_EVENTS:
+            # a sun trigger we cannot read is not a sun trigger we can ignore
+            _LOGGER.warning(
+                "Restart Guard could not find the sun event in %s, so this "
+                "trigger will not be reported", trigger,
+            )
+            return []
+        moment = sun_next(event, parse_offset(trigger_field(trigger, "offset")))
+        return [moment] if moment else []
+
+    return []
+
+
+# --------------------------------------------------------------------------
+# public entry point
+# --------------------------------------------------------------------------
+def compute(
+    automations: Iterable[AutomationInfo],
+    now: dt.datetime,
+    tz: dt.tzinfo,
+    lookahead: int,
+    resolve_entity: ResolveEntity,
+    sun_next: SunNext,
+    min_interval: int = 60,
+) -> list[dict[str, Any]]:
+    """Upcoming runs inside the lookahead window, soonest first."""
+    horizon = now + dt.timedelta(minutes=lookahead)
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for auto in automations:
+        for index, trigger in enumerate(auto.triggers):
+            if not is_enabled(trigger):
+                continue
+            days = weekdays_from(trigger) or auto.weekdays
+            try:
+                slots = trigger_slots(
+                    trigger, now, tz, lookahead, days,
+                    resolve_entity, sun_next, min_interval, auto.window,
+                )
+            except Exception:  # noqa: BLE001 - one bad trigger must not kill the sensor
+                # Never silently: a swallowed error here reads exactly like
+                # "nothing is due", which is the one wrong answer that costs a
+                # real automation run.
+                _LOGGER.warning(
+                    "Restart Guard could not work out when %s fires from %s",
+                    auto.entity_id, trigger, exc_info=True,
+                )
+                continue
+            for slot in slots:
+                if not (now < slot <= horizon):
+                    continue
+                # a run the time condition rules out never happens
+                if not in_window(slot, auto.window):
+                    continue
+                key = (auto.entity_id, slot.isoformat())
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append({
+                    "entity_id": auto.entity_id,
+                    "alias": auto.name,
+                    "at": slot.isoformat(),
+                    "at_ts": int(slot.timestamp()),
+                    "when": slot.strftime("%H:%M"),
+                    "minutes": round((slot - now).total_seconds() / 60.0, 1),
+                    # so condition checks can tell which choose branch applies
+                    "trigger_id": trigger.get("id"),
+                    "trigger_index": index,
+                })
+
+    items.sort(key=lambda item: item["minutes"])
+    return items

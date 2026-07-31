@@ -1,0 +1,60 @@
+name: Release
+
+# Publishing a release builds restart_guard.zip and attaches it to that release.
+# HACS then installs from the zip (hacs.json -> zip_release), which is also what
+# makes the GitHub download counter - and the downloads badge - actually count.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Take the version from the tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          echo "Releasing $version"
+          python3 - "$version" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          base = pathlib.Path("custom_components/restart_guard")
+
+          manifest_path = base / "manifest.json"
+          manifest = json.loads(manifest_path.read_text())
+          manifest["version"] = version
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+          const_path = base / "const.py"
+          const_path.write_text(
+              re.sub(
+                  r'VERSION = "[^"]*"',
+                  f'VERSION = "{version}"',
+                  const_path.read_text(),
+                  count=1,
+              )
+          )
+          print(f"manifest and const.py set to {version}")
+          PY
+
+      - name: Build the zip
+        run: |
+          cd custom_components/restart_guard
+          zip -r restart_guard.zip . -x '*__pycache__*' '*.pyc'
+          unzip -l restart_guard.zip
+
+      - name: Attach it to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: custom_components/restart_guard/restart_guard.zip
