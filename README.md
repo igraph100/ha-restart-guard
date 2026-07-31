@@ -382,7 +382,7 @@ MIT — see [LICENSE](LICENSE).
 
 [hacs-badge]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg
 [hacs-link]: https://github.com/hacs/integration
-[downloads-badge]: https://img.shields.io/github/downloads/igraph100/ha-restart-guard/total?label=downloads&color=41BDF5
+[downloads-badge]: https://img.shields.io/github/downloads/igraph100/ha-restart-guard/total?label=downloads&color=41BDF5&cacheSeconds=1800
 [release-badge]: https://img.shields.io/github/v/release/igraph100/ha-restart-guard?label=latest&color=41BDF5
 [releases-link]: https://github.com/igraph100/ha-restart-guard/releases
 [validate-badge]: https://github.com/igraph100/ha-restart-guard/actions/workflows/validate.yml/badge.svg
