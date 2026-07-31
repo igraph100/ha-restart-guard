@@ -210,8 +210,42 @@ class ConditionEvaluator:
             return None
         return bool(result) if result is not None else None
 
+    def _judgeable(self, configs: Any) -> list[dict[str, Any]]:
+        """The conditions we can fairly evaluate now; the rest are dropped.
+
+        Conditions are ANDed, so dropping some can only make the block MORE
+        likely to pass. If what is left still evaluates False, the whole block
+        is False whatever the dropped ones would have said - which is what lets
+        a branch be ruled out even when it also compares against the clock.
+
+        Dropped: anything measured against a wall-clock time, because "now" is
+        the wrong moment to read it, and anything naming an entity that does
+        not exist, because a missing entity reads False without meaning it.
+        """
+        return [
+            node
+            for node in as_list(configs)
+            if isinstance(node, dict)
+            and not uses_absolute_time(node)
+            and self.entities_known(node)
+        ]
+
     @staticmethod
-    def _trigger_variables(item: dict[str, Any]) -> dict[str, Any]:
+    def _item_trigger_ids(item: dict[str, Any]) -> list[str]:
+        """Every trigger id that fires this automation at this moment.
+
+        Two triggers can land on the same time, and the run has to be judged
+        against all of them: ruling it out on one branch while another would
+        have fired is exactly the wrong answer.
+        """
+        listed = item.get("trigger_ids")
+        if isinstance(listed, list) and listed:
+            return [str(value) for value in listed if value is not None]
+        single = item.get("trigger_id")
+        return [str(single)] if single is not None else []
+
+    @staticmethod
+    def _trigger_variables(trigger_id: Any) -> dict[str, Any]:
         """What Home Assistant puts in `trigger` when the automation fires.
 
         Without this, a `conditions:` block containing `condition: trigger` can
@@ -220,7 +254,7 @@ class ConditionEvaluator:
         commonly gate on the id at the top level, and every one of them was
         being silently skipped.
         """
-        return {"trigger": {"id": item.get("trigger_id"), "platform": "time"}}
+        return {"trigger": {"id": trigger_id, "platform": "time"}}
 
     async def async_verdict(
         self, entity: Any, item: dict[str, Any], same_day: bool
@@ -241,15 +275,23 @@ class ConditionEvaluator:
 
         # ---- 2. the automation's own conditions block -----------------------
         compiled = getattr(entity, "_condition", None)
+        ours = self._item_trigger_ids(item)
         if compiled is not None:
             configs = _configs_of(compiled)
-            if (
-                configs
-                and not uses_absolute_time(configs)
-                and self.entities_known(configs)
-            ):
-                result = self._check(compiled, self._trigger_variables(item))
-                if result is False:
+            judgeable = self._judgeable(configs) if configs else []
+            if judgeable:
+                # reuse the entity's own checker when nothing had to be dropped
+                checker = (
+                    compiled
+                    if len(judgeable) == len(as_list(configs))
+                    else await self._checker(judgeable)
+                )
+                # only rule the run out if it fails for every trigger that
+                # could have fired it at this moment
+                if checker is not None and all(
+                    self._check(checker, self._trigger_variables(tid)) is False
+                    for tid in (ours or [None])
+                ):
                     return Verdict(False, "automation conditions are not met")
 
         # ---- 3. the conditions on whichever choose branches could match -----
@@ -264,8 +306,8 @@ class ConditionEvaluator:
         `condition: trigger`, and none of those branches names this trigger,
         then firing it does nothing at all.
         """
-        trigger_id = item.get("trigger_id")
-        if not trigger_id:
+        ours = set(self._item_trigger_ids(item))
+        if not ours:
             return None
 
         blocks = _gate_blocks(raw.get("actions") or raw.get("action"))
@@ -279,8 +321,8 @@ class ConditionEvaluator:
                 )
                 if not ids:
                     return None  # an ungated branch could match anything
-                if str(trigger_id) in ids:
-                    return None  # this trigger does reach a branch
+                if ids & ours:
+                    return None  # one of this moment's triggers reaches a branch
 
         return Verdict(False, "no choose branch runs for this trigger")
 
@@ -293,7 +335,7 @@ class ConditionEvaluator:
         never satisfy `condition: trigger`, so branches gated on an id are
         simply out of reach for it.
         """
-        trigger_id = item.get("trigger_id")
+        ours = self._item_trigger_ids(item)
         blocks = _gate_blocks(raw.get("actions") or raw.get("action"))
         if blocks is None:
             return WILL_RUN
@@ -303,22 +345,25 @@ class ConditionEvaluator:
             for option in options:
                 configs = option.get("conditions") or option.get("condition")
                 ids = trigger_ids_of(configs)
-                if ids and (trigger_id is None or str(trigger_id) not in ids):
+                matched = ids & set(ours)
+                if ids and not matched:
                     continue  # this branch belongs to a different trigger
                 reachable += 1
 
                 others = _strip_trigger_conditions(configs)
-                if not others:
-                    return WILL_RUN  # nothing else gating it
-                if uses_absolute_time(others):
-                    return WILL_RUN  # cannot judge a clock comparison early
-                if not self.entities_known(others):
-                    return WILL_RUN  # a missing entity is not evidence of anything
-                checker = await self._checker(others)
+                judgeable = self._judgeable(others)
+                if not judgeable:
+                    return WILL_RUN  # nothing here we could rule it out on
+                checker = await self._checker(judgeable)
                 if checker is None:
                     return WILL_RUN  # would not compile, so assume it runs
-                if self._check(checker, self._trigger_variables(item)) is not False:
-                    return WILL_RUN  # passes, or could not tell
+                # an ungated branch is reached by whichever trigger fired
+                candidates = sorted(matched) or (ours or [None])
+                if any(
+                    self._check(checker, self._trigger_variables(tid)) is not False
+                    for tid in candidates
+                ):
+                    return WILL_RUN  # passes for some trigger, or could not tell
 
         if reachable == 0:
             return Verdict(False, "no choose branch runs for this trigger")

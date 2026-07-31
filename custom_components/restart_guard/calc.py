@@ -386,7 +386,9 @@ def compute(
     """Upcoming runs inside the lookahead window, soonest first."""
     horizon = now + dt.timedelta(minutes=lookahead)
     items: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    # where each (automation, moment) landed, so a second trigger firing at the
+    # same moment adds its id to that entry instead of being thrown away
+    at_slot: dict[tuple[str, str], int] = {}
 
     for auto in automations:
         for index, trigger in enumerate(auto.triggers):
@@ -414,9 +416,19 @@ def compute(
                 if not in_window(slot, auto.window):
                     continue
                 key = (auto.entity_id, slot.isoformat())
-                if key in seen:
+                trigger_id = trigger.get("id")
+                seen_at = at_slot.get(key)
+                if seen_at is not None:
+                    # Two triggers on the same automation at the same moment is
+                    # normal (a morning one and a festival one both at 09:15).
+                    # One entry is right for the list, but the condition check
+                    # has to know about both, or it judges the run by one
+                    # branch and rules it out while the other would have fired.
+                    ids = items[seen_at]["trigger_ids"]
+                    if trigger_id is not None and trigger_id not in ids:
+                        ids.append(trigger_id)
                     continue
-                seen.add(key)
+                at_slot[key] = len(items)
                 items.append({
                     "entity_id": auto.entity_id,
                     "alias": auto.name,
@@ -425,7 +437,8 @@ def compute(
                     "when": slot.strftime("%H:%M"),
                     "minutes": round((slot - now).total_seconds() / 60.0, 1),
                     # so condition checks can tell which choose branch applies
-                    "trigger_id": trigger.get("id"),
+                    "trigger_id": trigger_id,
+                    "trigger_ids": [] if trigger_id is None else [trigger_id],
                     "trigger_index": index,
                 })
 
