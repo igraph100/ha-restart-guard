@@ -205,6 +205,7 @@ class RestartGuardSensor(SensorEntity):
                 self._sun_next,
                 self._option(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL),
                 self._state_change_next,
+                self._calendar_moment,
             )
         except Exception as err:  # noqa: BLE001 - a bad automation must not kill the sensor
             _LOGGER.exception("Restart Guard could not work out the next run")
@@ -499,7 +500,7 @@ class RestartGuardSensor(SensorEntity):
         turns_on, turns_off = window_from_attributes(
             state.attributes, self._parse_moment
         )
-        if turns_on is not None or turns_off is not None:
+        if turns_on or turns_off:
             return state_edge(to_state, from_state, turns_on, turns_off, now)
 
         # 2. its integration publishes the moments instead
@@ -525,6 +526,18 @@ class RestartGuardSensor(SensorEntity):
         if to_state is not None or from_state is not None:
             return None
         return self._soonest(entry, keys, now)
+
+    def _calendar_moment(self, entity_id: str, which: str) -> dt.datetime | None:
+        """When the event this calendar is on, or waiting for, starts or ends.
+
+        A calendar entity publishes the current event while one is running and
+        the next one otherwise, so the same two attributes answer both.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        key = "end_time" if which == "end" else "start_time"
+        return self._parse_moment(state.attributes.get(key))
 
     def _jewish_key(self, entity_id: str) -> tuple[str | None, Any]:
         """Which jewish_calendar entity this is, and its registry entry."""

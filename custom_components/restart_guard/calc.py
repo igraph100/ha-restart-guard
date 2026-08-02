@@ -16,11 +16,16 @@ _LOGGER = logging.getLogger(__name__)
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 SUN_EVENTS = ("sunrise", "sunset")
+# old style is `trigger: calendar` with `event: start|end`; newer configs
+# name the edge in the trigger itself
+CALENDAR_KINDS = ("calendar", "calendar.event_started", "calendar.event_ended")
 
 ResolveEntity = Callable[[str], "dt.time | dt.datetime | None"]
 SunNext = Callable[[str, int], "dt.datetime | None"]
 # (entity_id, to, from) -> when that state change next happens
 StateNext = Callable[[str, Any, Any], "dt.datetime | None"]
+# (entity_id, "start"|"end") -> when the calendar event begins or ends
+CalendarNext = Callable[[str, str], "dt.datetime | None"]
 
 
 @dataclass
@@ -106,11 +111,24 @@ def is_entity_id(value: Any) -> bool:
 
 
 def parse_offset(value: Any) -> int:
-    """'-00:30:00' / '00:15' / 900 / timedelta -> seconds."""
+    """'-00:30:00' / '00:15' / 900 / timedelta / {minutes: 3} -> seconds."""
     if value in (None, ""):
         return 0
     if isinstance(value, dt.timedelta):
         return int(value.total_seconds())
+    if isinstance(value, dict):
+        # calendar triggers carry the offset as its parts rather than a string
+        try:
+            return int(
+                dt.timedelta(
+                    days=float(value.get("days") or 0),
+                    hours=float(value.get("hours") or 0),
+                    minutes=float(value.get("minutes") or 0),
+                    seconds=float(value.get("seconds") or 0),
+                ).total_seconds()
+            )
+        except (TypeError, ValueError):
+            return 0
     if isinstance(value, (int, float)):
         return int(value)
     text = str(value).strip()
@@ -208,30 +226,48 @@ def sun_slots(
     return sorted(moment for moment in candidates if moment > now)
 
 
-# Attribute pairs that mean "this entity is on between these two moments".
-# Nothing here is specific to any one integration: an entity that publishes
-# when it next changes is telling us something a `state` trigger otherwise
-# cannot know, whoever wrote it.
-WINDOW_ATTRIBUTES = (
-    ("Window_Start", "Window_End"),
-    ("window_start", "window_end"),
-    ("starts_at", "ends_at"),
-    ("start_time", "end_time"),
-)
+# "..._Start" / "..._End", or the same with a space. One integration alone
+# publishes Window_Start, Next_Window_Start, Next_Motzi_Window_Start,
+# Next_Off_Window_Start, Erev_Window_Start and "Next Window Start" - listing
+# them was never going to hold, so the shape is matched instead of the name.
+# Over-matching costs a warning nobody needed; under-matching loses a run.
+_START_SUFFIXES = ("_start", " start")
+_END_SUFFIXES = ("_end", " end")
+
+# names whose two halves don't end in start/end at all
+_EXTRA_STARTS = frozenset({"starts_at", "start_time"})
+_EXTRA_ENDS = frozenset({"ends_at", "end_time"})
 
 
 def window_from_attributes(
     attributes: Any, parse: Callable[[Any], "dt.datetime | None"]
-) -> tuple["dt.datetime | None", "dt.datetime | None"]:
-    """(turns on at, turns off at) for an entity that publishes its window."""
+) -> tuple[list["dt.datetime"], list["dt.datetime"]]:
+    """Every "turns on" and "turns off" moment this entity publishes.
+
+    An entity can announce several - a current window and a next one, an
+    ordinary one and an early-Shabbos one - and which matters depends on the
+    moment being asked about, so all of them come back and the caller picks.
+
+    A start with no matching end is kept too. Half a window still says when the
+    entity changes, and the alternative is discarding a moment we were told
+    about because a second one was missing.
+    """
     if not isinstance(attributes, dict):
-        return None, None
-    for start_key, end_key in WINDOW_ATTRIBUTES:
-        start = parse(attributes.get(start_key))
-        end = parse(attributes.get(end_key))
-        if start is not None or end is not None:
-            return start, end
-    return None, None
+        return [], []
+
+    starts: list[dt.datetime] = []
+    ends: list[dt.datetime] = []
+    for key, value in attributes.items():
+        lowered = str(key).lower()
+        if lowered.endswith(_START_SUFFIXES) or lowered in _EXTRA_STARTS:
+            moment = parse(value)
+            if moment is not None:
+                starts.append(moment)
+        elif lowered.endswith(_END_SUFFIXES) or lowered in _EXTRA_ENDS:
+            moment = parse(value)
+            if moment is not None:
+                ends.append(moment)
+    return sorted(starts), sorted(ends)
 
 
 def soonest_ahead(
@@ -261,8 +297,8 @@ def _wants(value: Any, state: str) -> bool:
 def state_edge(
     to_state: Any,
     from_state: Any,
-    turns_on: "dt.datetime | None",
-    turns_off: "dt.datetime | None",
+    turns_on: Any,
+    turns_off: Any,
     now: dt.datetime,
 ) -> "dt.datetime | None":
     """When a `state` trigger on an on/off entity next fires.
@@ -283,12 +319,16 @@ def state_edge(
     else:
         on = off = True
 
-    candidates = []
-    if on and turns_on is not None:
-        candidates.append(turns_on)
-    if off and turns_off is not None:
-        candidates.append(turns_off)
-    ahead = sorted(moment for moment in candidates if moment > now)
+    # either side may be a single moment or several, since an entity can
+    # publish more than one window
+    candidates: list[dt.datetime] = []
+    if on:
+        candidates += as_list(turns_on)
+    if off:
+        candidates += as_list(turns_off)
+    ahead = sorted(
+        moment for moment in candidates if moment is not None and moment > now
+    )
     return ahead[0] if ahead else None
 
 
@@ -421,6 +461,7 @@ def trigger_slots(
     min_interval: int,
     window: tuple[dt.time, dt.time] | None = None,
     state_next: StateNext | None = None,
+    calendar_next: CalendarNext | None = None,
 ) -> list[dt.datetime]:
     """Candidate fire times for a single trigger."""
     kind = trigger_kind(trigger)
@@ -454,6 +495,29 @@ def trigger_slots(
             return []
         moment = sun_next(event, parse_offset(trigger_field(trigger, "offset")))
         return [moment] if moment else []
+
+    if kind in CALENDAR_KINDS:
+        # A calendar entity publishes the start and end of the event it is on
+        # or waiting for, so a run driven by one is as knowable as a clock.
+        if calendar_next is None:
+            return []
+        if kind == "calendar":
+            which = str(trigger_field(trigger, "event") or "start").lower()
+        else:
+            which = "end" if kind.endswith("ended") else "start"
+        offset = parse_offset(trigger_field(trigger, "offset"))
+        # the new-style trigger says which side of the event it means here,
+        # rather than by the sign of the offset
+        if str(trigger_field(trigger, "offset_type") or "").lower() == "before":
+            offset = -abs(offset)
+        slots = []
+        for entity_id in as_list(trigger_field(trigger, "entity_id")):
+            if not is_entity_id(entity_id):
+                continue
+            moment = calendar_next(str(entity_id), "end" if which == "end" else "start")
+            if moment is not None:
+                slots.append(moment + dt.timedelta(seconds=offset))
+        return slots
 
     if kind == "state":
         # Most state triggers are unknowable - a door opens when it opens. But
@@ -498,6 +562,7 @@ def compute(
     sun_next: SunNext,
     min_interval: int = 60,
     state_next: StateNext | None = None,
+    calendar_next: CalendarNext | None = None,
 ) -> list[dict[str, Any]]:
     """Upcoming runs inside the lookahead window, soonest first."""
     horizon = now + dt.timedelta(minutes=lookahead)
@@ -515,7 +580,7 @@ def compute(
                 slots = trigger_slots(
                     trigger, now, tz, lookahead, days,
                     resolve_entity, sun_next, min_interval, auto.window,
-                    state_next,
+                    state_next, calendar_next,
                 )
             except Exception:  # noqa: BLE001 - one bad trigger must not kill the sensor
                 # Never silently: a swallowed error here reads exactly like

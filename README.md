@@ -268,6 +268,7 @@ card:
 | `time` with `weekday:` | Projected onto the right date |
 | `time_pattern` | Unless it repeats more often than the min interval |
 | `sun` with `offset` | `sun.sun`'s own `next_rising` / `next_setting`, the same times the trigger is scheduled from |
+| `calendar` event start / end, with an offset | The calendar entity's own `start_time` / `end_time` |
 | `state` on an entity that publishes when it next changes | The entity's own window attributes, or times published by its integration — see [Predictable state changes](#predictable-state-changes) |
 | Anything **mid-run** — `delay`, `wait_template`, `wait_for_trigger`, `repeat`, slow actions | The `current` attribute, so the action script doesn't need parsing |
 | `conditions:` blocks and `choose` branch conditions | Evaluated, see [When it stays quiet](#when-it-stays-quiet) |
@@ -300,36 +301,25 @@ A `state` trigger is normally unknowable — a door opens when it opens. But som
 announce when they next change, and a run driven by one of those is as predictable as
 any clock. Two sources are used, in that order:
 
-**The entity's own attributes.** Anything publishing a start/end pair —
-`Window_Start`/`Window_End`, `window_start`/`window_end`, `starts_at`/`ends_at`,
-`start_time`/`end_time` — is saying when it turns on and off. Nothing here is tied to a
-particular integration; if yours publishes a window, this works.
+**The entity's own attributes.** Any attribute ending in `_start` or `_end` (or the
+spaced form), plus `starts_at`/`ends_at` and `start_time`/`end_time`, is read as a
+window. Matching the shape rather than a fixed list of names matters: integrations
+name these inconsistently, and one may publish several windows at once — a current
+and a next, an ordinary and an early variant. All are kept and the soonest one still
+ahead wins. A start with no matching end counts too, since half a window still says
+when the entity changes.
 
-**Times published by the integration.** The core
-[`jewish_calendar`](https://www.home-assistant.io/integrations/jewish_calendar/)
-entities carry no attributes at all, but every one of them schedules its own
-re-evaluation — and the moments it schedules against are published as sensors. That
-schedule is transcribed straight from the integration's `next_update_fn` and
-`_update_times`:
+**Times published by the integration.** Some entities carry no attributes at all, yet
+their integration re-evaluates them at moments it publishes as sensors in their own
+right. Where that schedule is knowable, the entity's change is predicted from those
+sensors rather than from anything recomputed here — so whatever offsets and options the
+integration was configured with are already accounted for.
 
-| Entity | Changes at |
-|---|---|
-| `issur_melacha_in_effect` | candle lighting → on, havdalah → off |
-| `date`, `omer_count`, `daf_yomi` | shkia |
-| `weekly_portion` | havdalah |
-| `holiday` | candle lighting, else havdalah, else shkia |
-| `upcoming_candle_lighting`, `upcoming_havdalah`, and their `_shabbat_` variants | havdalah |
-| `erev_shabbat_hag`, `motzei_shabbat_hag` | those, plus the next sunrise |
-
-`issur_melacha_in_effect` is the one whose *direction* is known, so `to: "on"` resolves
-to candle lighting and `to: "off"` to havdalah. The rest change value at a known moment
-without a known destination — so an automation watching one for **any** change is
-predicted, while one watching for a **particular** value (`to: "Pesach"`) is not. It
-would otherwise be reported every single evening, and a banner you learn to ignore
+Where the *direction* of a change is known, `to: "on"` and `to: "off"` resolve to
+different moments. Where only the moment is known, an automation watching for **any**
+change is predicted while one watching for a **particular** value is not: that would
+otherwise be reported every time the value turned over, and a banner you learn to ignore
 protects nobody.
-
-The zmanim timestamp sensors — `shkia`, `netz_hachama`, `sof_zman_*` and the rest —
-have no `next_update_fn` at all, so they self-schedule nothing and aren't predicted.
 
 `to:` decides which edge is meant; failing that `from:` decides by implication, since a
 trigger leaving `off` waits for the same moment as one arriving at `on`. With neither,
@@ -385,7 +375,6 @@ These *do* publish or imply a fire time, so they could be supported. They are no
 | `state` with `for:` | `last_changed + for` | **Home Assistant drops the pending countdown on restart**, so the run vanishes silently |
 | `timer.*` finished | The timer's `finishes_at` attribute | Timers do not survive a restart either |
 | `schedule.*` helper (core) | The helper's `next_event` attribute | Not the same thing as the Scheduler component |
-| `calendar` | The next event's start / end | Offsets are supported by the trigger |
 
 The `for:` case is the most valuable of these, and the most dangerous, because the run
 is lost silently with nothing in the log.
