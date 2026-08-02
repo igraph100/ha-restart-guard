@@ -21,9 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No `ignore:` here, deliberately. Inclusion in the HACS default list
+      # requires this action to pass with no errors *and* no ignores, so an
+      # ignore that makes CI green would fail the submission instead.
+      # The brands check is satisfied by custom_components/restart_guard/brand/
+      # containing icon.png; it only falls back to the home-assistant/brands
+      # repository when that directory is missing.
       - uses: hacs/action@main
         with:
           category: integration
-          # "brands" only passes for integrations added to home-assistant/brands,
-          # which custom integrations are not. Without this the job always fails.
-          ignore: brands
