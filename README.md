@@ -207,9 +207,9 @@ follows the **Stay quiet when conditions can't pass** option.
 | Option | Default | What it does |
 |---|---|---|
 | Warn if an automation is due within | 6 min | How close counts as too close to restart |
-| Look ahead at most | 60 min | Automations further out than this aren't tracked |
+| Look ahead at most | 60 min | Automations further out than this aren't tracked. Up to 1440, since calendar-driven runs turn over 12-20 hours out |
 | Ignore automations repeating more often than | 60 min | Stops an every-5-minutes `time_pattern` from warning constantly |
-| Stop blocking on a run still going after | 60 min | A run in progress always warns you, but one still going after this long is probably parked in a `wait_for_trigger`, so it's listed without requiring the second tap |
+| Call a run long-running after | 60 min | Only affects wording. Any run in progress warns and needs the second tap, however long it has been going — a three-hour `delay` is exactly what a restart destroys |
 | Stay quiet when conditions can't pass | on | Skip automations that would fire and do nothing |
 | Also watch Scheduler schedules | on | Include scheduler-component schedules |
 
@@ -229,7 +229,7 @@ against `9999`.
 | `skipped_count` | How many were skipped |
 | `running` | Runs in progress: `alias`, `entity_id`, `current`, `seconds_ago`, `parked` |
 | `running_count` | How many are mid-run |
-| `blocking_runs` | Mid-run and not parked, i.e. the ones that arm the second tap |
+| `blocking_runs` | How many are mid-run, all of which arm the second tap |
 | `warn_window`, `lookahead` | Current options, read by the frontend module |
 | `automations_scanned` | How many automation entities were examined |
 | `trigger_kinds` | Count of each trigger kind recognised, e.g. `{"sun": 2, "time": 16}`. Tells "understood, not due" apart from "never recognised" |
@@ -268,6 +268,7 @@ card:
 | `time` with `weekday:` | Projected onto the right date |
 | `time_pattern` | Unless it repeats more often than the min interval |
 | `sun` with `offset` | `sun.sun`'s own `next_rising` / `next_setting`, the same times the trigger is scheduled from |
+| `state` on an entity that publishes when it next changes | The entity's own window attributes, or times published by its integration — see [Predictable state changes](#predictable-state-changes) |
 | Anything **mid-run** — `delay`, `wait_template`, `wait_for_trigger`, `repeat`, slow actions | The `current` attribute, so the action script doesn't need parsing |
 | `conditions:` blocks and `choose` branch conditions | Evaluated, see [When it stays quiet](#when-it-stays-quiet) |
 | Scheduler component schedules | The `next_trigger` attribute, enabled schedules only |
@@ -292,6 +293,56 @@ conditions:
 warn you, even though its trigger alone would fire 1440 times a day. Judged on the
 trigger it looks like pure noise; judged with the condition it is 21 runs a week, all on
 one evening. Automations that are switched off are ignored, since they can't fire.
+
+### Predictable state changes
+
+A `state` trigger is normally unknowable — a door opens when it opens. But some entities
+announce when they next change, and a run driven by one of those is as predictable as
+any clock. Two sources are used, in that order:
+
+**The entity's own attributes.** Anything publishing a start/end pair —
+`Window_Start`/`Window_End`, `window_start`/`window_end`, `starts_at`/`ends_at`,
+`start_time`/`end_time` — is saying when it turns on and off. Nothing here is tied to a
+particular integration; if yours publishes a window, this works.
+
+**Times published by the integration.** The core
+[`jewish_calendar`](https://www.home-assistant.io/integrations/jewish_calendar/)
+entities carry no attributes at all, but every one of them schedules its own
+re-evaluation — and the moments it schedules against are published as sensors. That
+schedule is transcribed straight from the integration's `next_update_fn` and
+`_update_times`:
+
+| Entity | Changes at |
+|---|---|
+| `issur_melacha_in_effect` | candle lighting → on, havdalah → off |
+| `date`, `omer_count`, `daf_yomi` | shkia |
+| `weekly_portion` | havdalah |
+| `holiday` | candle lighting, else havdalah, else shkia |
+| `upcoming_candle_lighting`, `upcoming_havdalah`, and their `_shabbat_` variants | havdalah |
+| `erev_shabbat_hag`, `motzei_shabbat_hag` | those, plus the next sunrise |
+
+`issur_melacha_in_effect` is the one whose *direction* is known, so `to: "on"` resolves
+to candle lighting and `to: "off"` to havdalah. The rest change value at a known moment
+without a known destination — so an automation watching one for **any** change is
+predicted, while one watching for a **particular** value (`to: "Pesach"`) is not. It
+would otherwise be reported every single evening, and a banner you learn to ignore
+protects nobody.
+
+The zmanim timestamp sensors — `shkia`, `netz_hachama`, `sof_zman_*` and the rest —
+have no `next_update_fn` at all, so they self-schedule nothing and aren't predicted.
+
+`to:` decides which edge is meant; failing that `from:` decides by implication, since a
+trigger leaving `off` waits for the same moment as one arriving at `on`. With neither,
+any change counts and the sooner edge wins.
+
+> [!NOTE]
+> This only ever *adds* warnings. A trigger it can't resolve is treated exactly as it
+> was before — invisible — so the worst case is a warning you didn't need rather than a
+> run you weren't told about.
+
+Deliberately left alone: `state` with `for:`, because the run happens some time *after*
+the change and reporting the change time would be the wrong minute, and `attribute:`
+triggers, which watch something other than the state.
 
 
 ---
@@ -320,6 +371,10 @@ Nothing can predict these, because predicting them means predicting the future. 
 
 If a motion sensor trips two seconds after you press Restart, that automation is lost
 and the banner was green. This is not a bug and cannot be fixed.
+
+The exception is a `state` trigger on an entity that *publishes* when it next changes —
+those are predictable and are covered. See
+[Predictable state changes](#predictable-state-changes).
 
 ### Predictable, but not implemented yet
 

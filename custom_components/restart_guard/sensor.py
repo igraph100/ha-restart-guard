@@ -22,9 +22,12 @@ from .calc import (
     AutomationInfo,
     as_list,
     compute,
+    soonest_ahead,
+    state_edge,
     sun_slots,
     time_window_from_conditions,
     trigger_kind,
+    window_from_attributes,
     weekdays_from_conditions,
 )
 from .conditions import ConditionEvaluator
@@ -53,10 +56,51 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = dt.timedelta(seconds=30)
 AUTOMATION_DOMAIN = "automation"
+# how many upcoming runs to carry in the attributes; the banner lists six
+MAX_ITEMS = 100
 
 # `sun.sun` publishes the same times the sun trigger is scheduled from
 SUN_ENTITY = "sun.sun"
 SUN_ATTRIBUTES = {"sunrise": "next_rising", "sunset": "next_setting"}
+
+# A `state` trigger is normally unknowable. The native jewish_calendar
+# integration is an exception: every one of its entities schedules its own
+# re-evaluation, and the moments it schedules against are published as sensors.
+# The two tables below are those schedules, transcribed from the integration's
+# `next_update_fn` (sensor.py) and `_update_times` (binary_sensor.py).
+JEWISH_CALENDAR = "jewish_calendar"
+CANDLE_KEY = "upcoming_candle_lighting"
+HAVDALAH_KEY = "upcoming_havdalah"
+SHKIA_KEY = "shkia"
+NETZ_KEY = "netz_hachama"
+
+# Entities whose direction is known, so `to:` / `from:` can pick an edge.
+JEWISH_EDGES: dict[str, dict[str, tuple[str, ...]]] = {
+    "issur_melacha_in_effect": {"on": (CANDLE_KEY,), "off": (HAVDALAH_KEY,)},
+}
+
+# Entities that change value at a known moment, but not in a known direction.
+# `holiday` really updates at "candle lighting, else havdalah, else shkia";
+# taking the soonest of the three is the same answer on every ordinary day and
+# errs earlier, which is the safe direction for a warning.
+JEWISH_CHANGES: dict[str, tuple[str, ...]] = {
+    "date": (SHKIA_KEY,),
+    "omer_count": (SHKIA_KEY,),
+    "daf_yomi": (SHKIA_KEY,),
+    "weekly_portion": (HAVDALAH_KEY,),
+    "holiday": (CANDLE_KEY, HAVDALAH_KEY, SHKIA_KEY),
+    "upcoming_candle_lighting": (HAVDALAH_KEY,),
+    "upcoming_havdalah": (HAVDALAH_KEY,),
+    "upcoming_shabbat_candle_lighting": (HAVDALAH_KEY,),
+    "upcoming_shabbat_havdalah": (HAVDALAH_KEY,),
+    "erev_shabbat_hag": (CANDLE_KEY, HAVDALAH_KEY, NETZ_KEY),
+    "motzei_shabbat_hag": (CANDLE_KEY, HAVDALAH_KEY, NETZ_KEY),
+}
+
+# longest first, so upcoming_candle_lighting is not matched as candle_lighting
+JEWISH_KEYS = sorted(
+    set(JEWISH_EDGES) | set(JEWISH_CHANGES), key=len, reverse=True
+)
 
 
 async def async_setup_entry(
@@ -93,6 +137,7 @@ class RestartGuardSensor(SensorEntity):
         self._value: float = NOTHING_DUE
         self._error: str | None = None
         self._scanned = 0
+        self._total = 0
         self._trigger_kinds: dict[str, int] = {}
 
     # -- options ----------------------------------------------------------
@@ -119,7 +164,7 @@ class RestartGuardSensor(SensorEntity):
             # so "did my copy actually land?" is answerable at a glance
             "version": VERSION,
             "items": self._items,
-            "count": len(self._items),
+            "count": self._total,
             "next_at": self._items[0]["at"] if self._items else None,
             # would fire but do nothing, so deliberately not warned about
             "skipped": self._skipped,
@@ -127,7 +172,8 @@ class RestartGuardSensor(SensorEntity):
             # automations / scripts part-way through a run right now
             "running": self._running,
             "running_count": len(self._running),
-            "blocking_runs": sum(1 for run in self._running if not run["parked"]),
+            # every run in progress blocks now, however long it has been going
+            "blocking_runs": len(self._running),
             "warn_window": self._option(CONF_WARN_WINDOW, DEFAULT_WARN_WINDOW),
             "lookahead": self._option(CONF_LOOKAHEAD, DEFAULT_LOOKAHEAD),
             "automations_scanned": self._scanned,
@@ -158,10 +204,12 @@ class RestartGuardSensor(SensorEntity):
                 self._resolve_entity_time,
                 self._sun_next,
                 self._option(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL),
+                self._state_change_next,
             )
         except Exception as err:  # noqa: BLE001 - a bad automation must not kill the sensor
             _LOGGER.exception("Restart Guard could not work out the next run")
             self._error = str(err)
+            self._total = 0
             self._items = []
             self._skipped = []
             self._value = NOTHING_DUE
@@ -204,8 +252,13 @@ class RestartGuardSensor(SensorEntity):
                 _LOGGER.exception("Restart Guard could not read Scheduler schedules")
 
         self._error = None
-        self._items = items
-        self._skipped = skipped
+        # Attributes are written to the recorder every time this updates, and
+        # a day-long lookahead can turn up hundreds of runs. The banner shows
+        # six, so carrying every one would cost database for nothing. `count`
+        # stays truthful, so nothing that reads it is misled by the trim.
+        self._total = len(items)
+        self._items = items[:MAX_ITEMS]
+        self._skipped = skipped[:MAX_ITEMS]
         self._value = items[0]["minutes"] if items else NOTHING_DUE
 
     def _schedule_lookup(self):
@@ -426,6 +479,95 @@ class RestartGuardSensor(SensorEntity):
                 kind = trigger_kind(trigger) or "unknown"
                 kinds[kind] = kinds.get(kind, 0) + 1
         self._trigger_kinds = dict(sorted(kinds.items()))
+
+    def _state_change_next(
+        self, entity_id: str, to_state: Any, from_state: Any
+    ) -> dt.datetime | None:
+        """When a watched entity next changes state, if it can be known.
+
+        Most `state` triggers are unknowable and stay that way. Two kinds are
+        not: an entity that publishes its own window, and one whose integration
+        publishes the moments it flips. Anything else returns None, which is
+        exactly what happened before this existed.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        now = dt_util.now()
+
+        # 1. the entity publishes its own window
+        turns_on, turns_off = window_from_attributes(
+            state.attributes, self._parse_moment
+        )
+        if turns_on is not None or turns_off is not None:
+            return state_edge(to_state, from_state, turns_on, turns_off, now)
+
+        # 2. its integration publishes the moments instead
+        key, entry = self._jewish_key(entity_id)
+        if key is None:
+            return None
+
+        edges = JEWISH_EDGES.get(key)
+        if edges is not None:
+            return state_edge(
+                to_state, from_state,
+                self._soonest(entry, edges["on"], now),
+                self._soonest(entry, edges["off"], now),
+                now,
+            )
+
+        keys = JEWISH_CHANGES.get(key)
+        if keys is None:
+            return None
+        # We know when this changes, not what it changes to. A `to:` naming a
+        # particular holiday would then be reported every single evening, which
+        # is noise - and a banner you learn to ignore protects nobody.
+        if to_state is not None or from_state is not None:
+            return None
+        return self._soonest(entry, keys, now)
+
+    def _jewish_key(self, entity_id: str) -> tuple[str | None, Any]:
+        """Which jewish_calendar entity this is, and its registry entry."""
+        registry = er.async_get(self.hass)
+        entry = registry.async_get(entity_id)
+        if entry is None or entry.platform != JEWISH_CALENDAR:
+            return None, None
+        name = f"{entry.unique_id or ''}|{entity_id}"
+        for key in JEWISH_KEYS:
+            if name.endswith(key):
+                return key, entry
+        return None, None
+
+    def _soonest(
+        self, entry: Any, keys: tuple[str, ...], now: dt.datetime
+    ) -> dt.datetime | None:
+        """The nearest moment published by these sibling sensors."""
+        if entry is None:
+            return None
+        registry = er.async_get(self.hass)
+        found: list[dt.datetime | None] = []
+        for other in er.async_entries_for_config_entry(
+            registry, entry.config_entry_id
+        ):
+            name = f"{other.unique_id or ''}|{other.entity_id}"
+            if any(name.endswith(key) for key in keys):
+                found.append(self._entity_moment(other.entity_id))
+        return soonest_ahead(found, now)
+
+    def _entity_moment(self, entity_id: str) -> dt.datetime | None:
+        """A timestamp entity's value."""
+        state = self.hass.states.get(entity_id)
+        return self._parse_moment(state.state) if state else None
+
+    @staticmethod
+    def _parse_moment(value: Any) -> dt.datetime | None:
+        """An attribute or state that might be a moment in time."""
+        if isinstance(value, dt.datetime):
+            return dt_util.as_local(value)
+        if not value or str(value) in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            return None
+        parsed = dt_util.parse_datetime(str(value))
+        return dt_util.as_local(parsed) if parsed else None
 
     def _sun_next(self, event: str, offset: int) -> dt.datetime | None:
         """Next sunrise/sunset with the trigger's offset applied.

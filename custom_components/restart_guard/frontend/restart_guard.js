@@ -90,8 +90,11 @@
       parked: (attrs.running || []).filter((run) => run.parked),
       dueSoon: count > 0 && isFinite(mins) && mins <= win,
       clear: count > 0 && isFinite(mins) && mins > win,
+      // Anything part-way through a run is at risk, however long it has been
+      // going. A three-hour delay is exactly the case a restart destroys, and
+      // it used to read as safe simply for taking a while.
       get warn() {
-        return this.dueSoon || this.blocking.length > 0;
+        return this.dueSoon || this.running.length > 0;
       },
     };
   }
@@ -127,6 +130,18 @@
         display: block; font-weight: 700; font-size: 14.5px; line-height: 1.35;
       }
       .rg-tm { display: block; font-size: 13px; opacity: 0.8; }
+      /*
+       * A run already in progress. Everything else on the banner is a
+       * prediction; this one is happening, and restarting ends it. So it gets
+       * a heavier bar, a stronger fill and full-strength text rather than the
+       * dimmed meta line the upcoming rows use.
+       */
+      .rg-row.rg-live {
+        border-left-width: 5px;
+        background: rgba(219, 68, 55, 0.18);
+      }
+      .rg-row.rg-live .rg-tm { opacity: 1; font-weight: 700; }
+      .rg-row.rg-live .rg-pill { background: rgba(219, 68, 55, 0.3); }
       /* which kind of thing this row is: automation, script or Scheduler */
       .rg-pill {
         display: inline-block;
@@ -232,9 +247,10 @@
    * coloured bar down the left. Names and times are what you actually need to
    * read, so they get their own lines rather than being buried in a sentence.
    */
-  function row(name, detail, pill) {
+  function row(name, detail, pill, extra) {
     return (
-      `<span class="rg-row"><span class="rg-nm">${esc(name)}</span>` +
+      `<span class="rg-row${extra ? " " + extra : ""}">` +
+      `<span class="rg-nm">${esc(name)}</span>` +
       `<span class="rg-tm">` +
       (pill ? `<span class="rg-pill">${esc(pill)}</span>` : "") +
       `${esc(detail)}</span></span>`
@@ -266,32 +282,32 @@
     );
   }
 
+  /** "for 12 s" / "for 4 min" / "for 3 hr 20 min" - how long it has been going. */
   function ago(seconds) {
     if (seconds == null || !isFinite(seconds)) return "";
-    if (seconds < 60) return `started ${Math.round(seconds)} s ago`;
+    if (seconds < 60) return `for ${Math.round(seconds)} s`;
     const mins = Math.round(seconds / 60);
-    if (mins < 60) return `started ${mins} min ago`;
+    if (mins < 60) return `for ${mins} min`;
     const hours = Math.floor(mins / 60);
     const rest = mins % 60;
-    return rest
-      ? `running for ${hours} hr ${rest} min`
-      : `running for ${hours} hr`;
+    return rest ? `for ${hours} hr ${rest} min` : `for ${hours} hr`;
   }
 
+  /**
+   * A run in progress. Said plainly and marked out from the upcoming rows,
+   * because this is the one case where the damage is certain rather than
+   * predicted: the automation is running now, and restarting ends it here.
+   * How long it has been going is context, not the point.
+   */
   function describeRun(run) {
     const detail = ago(run.seconds_ago);
     return row(
       trimKind(run.alias),
-      detail ? `running right now · ${detail}` : "running right now",
-      kindOf(run)
-    );
-  }
-
-  function describeParked(run) {
-    return row(
-      trimKind(run.alias),
-      `${ago(run.seconds_ago)} · probably waiting on something`,
-      kindOf(run)
+      detail
+        ? `Still running ${detail} — restarting stops it`
+        : "Still running — restarting stops it",
+      kindOf(run),
+      "rg-live"
     );
   }
 
@@ -313,12 +329,11 @@
   function describeState(info, armed) {
     if (!info || info.missing) return null;
 
-    const parkedNote = info.parked.length
-      ? info.parked.slice(0, MAX_LISTED).map(describeParked).join("")
-      : "";
-
     if (info.warn) {
-      const runLines = info.blocking.slice(0, MAX_LISTED).map(describeRun).join("");
+      // Every run in progress, first and together. A long-running one used to
+      // be listed underneath the upcoming rows, which buried the one line on
+      // screen describing damage that is certain rather than predicted.
+      const runLines = info.running.slice(0, MAX_LISTED).map(describeRun).join("");
       // only what a restart would actually put at risk: the rest of the
       // lookahead is context, and reading it is what makes this slow
       const dueLines = info.dueSoon
@@ -336,12 +351,13 @@
           : "");
 
       // lead with the number that decides it: how long you have
+      const midRun = info.running.length;
       let title;
-      if (info.blocking.length && info.dueSoon) {
+      if (midRun && info.dueSoon) {
         title = `Wait — something is running, next run ${relative(info.mins)}`;
-      } else if (info.blocking.length) {
+      } else if (midRun) {
         title = plural(
-          info.blocking.length,
+          midRun,
           "Wait — an automation is running right now",
           "Wait — {n} automations are running right now"
         );
@@ -350,7 +366,7 @@
       }
 
       const hints = [];
-      if (info.blocking.length) {
+      if (midRun) {
         hints.push(
           "Restarting now cuts a run off part-way through, so any steps after a " +
             "wait or delay never happen."
@@ -369,7 +385,6 @@
           runLines +
           dueLines +
           more +
-          parkedNote +
           `<span class="rg-hint">${esc(hints.join(" "))}</span>` +
           (armed
             ? `<span class="rg-armed">Tap Restart again to go ahead anyway</span>`
@@ -388,7 +403,7 @@
         title: next
           ? `Safe to restart — next run ${relative(next.minutes)}`
           : "Safe to restart",
-        body: (next ? describe(next) : "") + parkedNote,
+        body: next ? describe(next) : "",
       };
     }
 
@@ -398,7 +413,6 @@
       body:
         `<span class="rg-line">Nothing scheduled in the next ` +
         `${info.lookahead} minutes, and nothing is mid-run.</span>` +
-        parkedNote +
         (info.error
           ? `<span class="rg-hint">Restart Guard reported: ${esc(info.error)}</span>`
           : ""),

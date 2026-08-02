@@ -46,10 +46,13 @@ def _schema(current: dict[str, Any]) -> vol.Schema:
                 CONF_WARN_WINDOW,
                 default=current.get(CONF_WARN_WINDOW, DEFAULT_WARN_WINDOW),
             ): _number(1, 60),
+            # up to a full day: calendar-driven automations turn over at
+            # sunset or candle lighting, which is routinely 12-20 hours out,
+            # and a four-hour ceiling could never reach them
             vol.Required(
                 CONF_LOOKAHEAD,
                 default=current.get(CONF_LOOKAHEAD, DEFAULT_LOOKAHEAD),
-            ): _number(10, 240),
+            ): _number(10, 1440),
             vol.Required(
                 CONF_MIN_INTERVAL,
                 default=current.get(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL),

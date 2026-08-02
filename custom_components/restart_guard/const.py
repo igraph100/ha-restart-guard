@@ -1,7 +1,7 @@
 """Constants for Restart Guard."""
 
 DOMAIN = "restart_guard"
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 
 CONF_WARN_WINDOW = "warn_window"
 CONF_LOOKAHEAD = "lookahead"

@@ -19,6 +19,8 @@ SUN_EVENTS = ("sunrise", "sunset")
 
 ResolveEntity = Callable[[str], "dt.time | dt.datetime | None"]
 SunNext = Callable[[str, int], "dt.datetime | None"]
+# (entity_id, to, from) -> when that state change next happens
+StateNext = Callable[[str, Any, Any], "dt.datetime | None"]
 
 
 @dataclass
@@ -206,6 +208,90 @@ def sun_slots(
     return sorted(moment for moment in candidates if moment > now)
 
 
+# Attribute pairs that mean "this entity is on between these two moments".
+# Nothing here is specific to any one integration: an entity that publishes
+# when it next changes is telling us something a `state` trigger otherwise
+# cannot know, whoever wrote it.
+WINDOW_ATTRIBUTES = (
+    ("Window_Start", "Window_End"),
+    ("window_start", "window_end"),
+    ("starts_at", "ends_at"),
+    ("start_time", "end_time"),
+)
+
+
+def window_from_attributes(
+    attributes: Any, parse: Callable[[Any], "dt.datetime | None"]
+) -> tuple["dt.datetime | None", "dt.datetime | None"]:
+    """(turns on at, turns off at) for an entity that publishes its window."""
+    if not isinstance(attributes, dict):
+        return None, None
+    for start_key, end_key in WINDOW_ATTRIBUTES:
+        start = parse(attributes.get(start_key))
+        end = parse(attributes.get(end_key))
+        if start is not None or end is not None:
+            return start, end
+    return None, None
+
+
+def soonest_ahead(
+    candidates: Iterable["dt.datetime | None"], now: dt.datetime
+) -> "dt.datetime | None":
+    """The nearest of these moments still ahead of us.
+
+    A published time that has already passed today is not useless - a sensor
+    that turns over at sunset turns over again at the next one - so a stale
+    value rolls forward a day rather than being discarded. A day's drift on a
+    solar time is about a minute, far finer than this needs. Times that are
+    already in the future are taken as they are.
+    """
+    ahead = []
+    for moment in candidates:
+        if moment is None:
+            continue
+        ahead.append(moment if moment > now else moment + dt.timedelta(days=1))
+    return min(ahead) if ahead else None
+
+
+def _wants(value: Any, state: str) -> bool:
+    """True if a trigger's `to:` or `from:` mentions this state."""
+    return any(str(item).lower() == state for item in as_list(value))
+
+
+def state_edge(
+    to_state: Any,
+    from_state: Any,
+    turns_on: "dt.datetime | None",
+    turns_off: "dt.datetime | None",
+    now: dt.datetime,
+) -> "dt.datetime | None":
+    """When a `state` trigger on an on/off entity next fires.
+
+    `to:` decides it outright. Failing that `from:` does, by implication - a
+    trigger leaving "off" is waiting for the same moment as one arriving at
+    "on". With neither, any change counts, so whichever edge comes first wins.
+
+    Only ever returns a moment still ahead of `now`: a window that has already
+    closed says nothing about the next one.
+    """
+    if to_state is not None or from_state is not None:
+        on = _wants(to_state, "on") or _wants(from_state, "off")
+        off = _wants(to_state, "off") or _wants(from_state, "on")
+        # a `to:` we do not recognise is not an invitation to guess
+        if not on and not off:
+            return None
+    else:
+        on = off = True
+
+    candidates = []
+    if on and turns_on is not None:
+        candidates.append(turns_on)
+    if off and turns_off is not None:
+        candidates.append(turns_off)
+    ahead = sorted(moment for moment in candidates if moment > now)
+    return ahead[0] if ahead else None
+
+
 def pattern_hit(value: int, spec: Any) -> bool:
     if spec in (None, "*", "**"):
         return True
@@ -334,6 +420,7 @@ def trigger_slots(
     sun_next: SunNext,
     min_interval: int,
     window: tuple[dt.time, dt.time] | None = None,
+    state_next: StateNext | None = None,
 ) -> list[dt.datetime]:
     """Candidate fire times for a single trigger."""
     kind = trigger_kind(trigger)
@@ -368,6 +455,34 @@ def trigger_slots(
         moment = sun_next(event, parse_offset(trigger_field(trigger, "offset")))
         return [moment] if moment else []
 
+    if kind == "state":
+        # Most state triggers are unknowable - a door opens when it opens. But
+        # some entities announce when they next change, and those runs are as
+        # predictable as any clock. Anything we cannot resolve returns nothing,
+        # exactly as before, so this only ever adds warnings.
+        if state_next is None:
+            return []
+        # `for:` means the run happens some time after the change, and Home
+        # Assistant drops that pending countdown on restart. Predicting the
+        # change but not the delay would report the wrong minute, so leave it.
+        if trigger_field(trigger, "for") is not None:
+            return []
+        # an attribute trigger watches something other than the state itself
+        if trigger_field(trigger, "attribute") is not None:
+            return []
+        slots = []
+        for entity_id in as_list(trigger_field(trigger, "entity_id")):
+            if not is_entity_id(entity_id):
+                continue
+            moment = state_next(
+                str(entity_id),
+                trigger_field(trigger, "to"),
+                trigger_field(trigger, "from"),
+            )
+            if moment is not None:
+                slots.append(moment)
+        return slots
+
     return []
 
 
@@ -382,6 +497,7 @@ def compute(
     resolve_entity: ResolveEntity,
     sun_next: SunNext,
     min_interval: int = 60,
+    state_next: StateNext | None = None,
 ) -> list[dict[str, Any]]:
     """Upcoming runs inside the lookahead window, soonest first."""
     horizon = now + dt.timedelta(minutes=lookahead)
@@ -399,6 +515,7 @@ def compute(
                 slots = trigger_slots(
                     trigger, now, tz, lookahead, days,
                     resolve_entity, sun_next, min_interval, auto.window,
+                    state_next,
                 )
             except Exception:  # noqa: BLE001 - one bad trigger must not kill the sensor
                 # Never silently: a swallowed error here reads exactly like
