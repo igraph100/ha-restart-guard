@@ -143,9 +143,17 @@ branches gated on ordinary conditions are evaluated as usual. An automation whos
 branches all test one entity goes quiet if that entity is `unavailable`, because then
 no branch can match.
 
-The evaluation uses live state, so a branch condition on an entity that flips in the
-next few minutes can be judged on the wrong value. That only suppresses a warning when
-every reachable branch currently fails — but it is the assumption to be aware of.
+The evaluation uses live state, which raises an obvious problem: a condition on an
+entity that flips between now and the trigger would be judged on the wrong value. A
+sensor reading `off` at 19:45 and `on` at 20:00 would rule out a 20:00 run that is
+certain to happen — a green "safe to restart" a quarter of an hour before something
+unavoidable, which is the one answer this exists never to give.
+
+So a condition naming an entity whose next change *is* knowable — by any of the means
+in [Predictable state changes](#predictable-state-changes) — is not used to rule a run
+out when that change falls before the trigger. The condition is set aside and the run
+warns instead. For an ordinary helper or switch, whose changes nobody can foresee, this
+costs nothing and the old caveat still applies.
 
 **When in doubt, it warns.** A wrong "safe to restart" costs you a real automation run,
 so anything that can't be judged confidently counts as *will run*:
@@ -233,6 +241,8 @@ against `9999`.
 | `warn_window`, `lookahead` | Current options, read by the frontend module |
 | `automations_scanned` | How many automation entities were examined |
 | `trigger_kinds` | Count of each trigger kind recognised, e.g. `{"sun": 2, "time": 16}`. Tells "understood, not due" apart from "never recognised" |
+| `state_predictions` | How each predicted state change was worked out — the entity's own window, its integration's published moments, a boolean attribute, a running `for:` countdown, or a timer |
+| `state_debug` | `attribute:` triggers that produced no answer, and why. Empty is the healthy state |
 | `version` | The running version, so you can confirm an update actually landed |
 | `schedules_scanned` | How many Scheduler entities were examined |
 | `schedule_conditions` | Diagnostic: `ok`, `disabled by option`, `scheduler not in hass.data`, `no coordinator (…)` |
@@ -269,6 +279,9 @@ card:
 | `time_pattern` | Unless it repeats more often than the min interval |
 | `sun` with `offset` | `sun.sun`'s own `next_rising` / `next_setting`, the same times the trigger is scheduled from |
 | `calendar` event start / end, with an offset | The calendar entity's own `start_time` / `end_time` |
+| `state` with `for:` | The countdown already running (`last_changed` + the delay), or the predicted change plus it |
+| `timer.*` finishing | The timer's own `finishes_at`, while it is running |
+| `state` on an `attribute:` | The same published windows, read for that attribute rather than the state |
 | `state` on an entity that publishes when it next changes | The entity's own window attributes, or times published by its integration — see [Predictable state changes](#predictable-state-changes) |
 | Anything **mid-run** — `delay`, `wait_template`, `wait_for_trigger`, `repeat`, slow actions | The `current` attribute, so the action script doesn't need parsing |
 | `conditions:` blocks and `choose` branch conditions | Evaluated, see [When it stays quiet](#when-it-stays-quiet) |
@@ -372,12 +385,7 @@ These *do* publish or imply a fire time, so they could be supported. They are no
 
 | Trigger | Where the time lives | Why it matters |
 |---|---|---|
-| `state` with `for:` | `last_changed + for` | **Home Assistant drops the pending countdown on restart**, so the run vanishes silently |
-| `timer.*` finished | The timer's `finishes_at` attribute | Timers do not survive a restart either |
 | `schedule.*` helper (core) | The helper's `next_event` attribute | Not the same thing as the Scheduler component |
-
-The `for:` case is the most valuable of these, and the most dangerous, because the run
-is lost silently with nothing in the log.
 
 ### Outside Home Assistant entirely
 
@@ -409,9 +417,9 @@ the downtime will fail.
   that get dropped.
 - **Disabled automations and schedules** are ignored, correctly — but if you re-enable
   one, allow up to 30 seconds for the sensor to notice.
-- **Condition checks use live state.** A condition on an entity that flips between now
-  and the trigger was judged on the old value. This only ever suppresses a warning when
-  every reachable branch currently fails.
+- **Condition checks use live state**, except where the entity's next change is
+  knowable. A condition on an unpredictable entity that flips between now and the
+  trigger is still judged on the old value.
 - **Safe mode.** Core serves no extra frontend modules, so no banner appears at all.
 
 ---
