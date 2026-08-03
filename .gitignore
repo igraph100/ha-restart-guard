@@ -15,3 +15,6 @@ __pycache__/
 #   brand_src/  - SVG sources and the generator for the brand PNGs
 tests/
 brand_src/
+
+__pycache__/
+*.pyc

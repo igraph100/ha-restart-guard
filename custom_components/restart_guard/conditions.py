@@ -19,6 +19,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import condition as condition_helper
+from homeassistant.util import dt as dt_util
 
 from .calc import as_list, is_enabled
 
@@ -150,9 +151,11 @@ def _gate_blocks(actions: Any) -> list[list[dict[str, Any]]] | None:
 class ConditionEvaluator:
     """Evaluates automation and choose-branch conditions, with a compile cache."""
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, changes_before: Any = None) -> None:
         self._hass = hass
         self._cache: dict[str, Any] = {}
+        # (entity_id, moment) -> "does this entity change in between?"
+        self._changes_before = changes_before
 
     async def _checker(self, configs: list[dict[str, Any]]) -> Any | None:
         """Compile (and cache) a condition checker, or None if it won't compile.
@@ -210,7 +213,34 @@ class ConditionEvaluator:
             return None
         return bool(result) if result is not None else None
 
-    def _judgeable(self, configs: Any) -> list[dict[str, Any]]:
+    def _volatile(self, node: Any, until: Any) -> bool:
+        """Does any entity this condition names change before the run?
+
+        This is the difference between reading live state as a proxy and
+        reading it as the answer. `binary_sensor.yidcal_no_melucha` is off at
+        19:45 and on at 20:00; a condition requiring it to be on reads False
+        now and True when the automation actually fires. Ruling the run out on
+        the current value produces a green "safe to restart" a quarter of an
+        hour before something that will definitely happen - which is the one
+        answer this integration exists to never give.
+
+        Only entities whose next change is *knowable* count here, so this costs
+        nothing for the ordinary case of a condition on a helper or a switch.
+        """
+        if until is None or self._changes_before is None:
+            return False
+        for inner in _walk(node):
+            for entity_id in as_list(inner.get("entity_id")):
+                if not isinstance(entity_id, str) or "." not in entity_id:
+                    continue
+                try:
+                    if self._changes_before(entity_id, until):
+                        return True
+                except Exception:  # noqa: BLE001 - unknown means unusable
+                    return True
+        return False
+
+    def _judgeable(self, configs: Any, until: Any = None) -> list[dict[str, Any]]:
         """The conditions we can fairly evaluate now; the rest are dropped.
 
         Conditions are ANDed, so dropping some can only make the block MORE
@@ -219,8 +249,10 @@ class ConditionEvaluator:
         a branch be ruled out even when it also compares against the clock.
 
         Dropped: anything measured against a wall-clock time, because "now" is
-        the wrong moment to read it, and anything naming an entity that does
-        not exist, because a missing entity reads False without meaning it.
+        the wrong moment to read it; anything naming an entity that does not
+        exist, because a missing entity reads False without meaning it; and
+        anything naming an entity that changes before the run, because then now
+        is the wrong moment to read that too.
         """
         return [
             node
@@ -228,6 +260,7 @@ class ConditionEvaluator:
             if isinstance(node, dict)
             and not uses_absolute_time(node)
             and self.entities_known(node)
+            and not self._volatile(node, until)
         ]
 
     @staticmethod
@@ -274,11 +307,12 @@ class ConditionEvaluator:
             return WILL_RUN
 
         # ---- 2. the automation's own conditions block -----------------------
+        until = dt_util.parse_datetime(str(item.get("at") or ""))
         compiled = getattr(entity, "_condition", None)
         ours = self._item_trigger_ids(item)
         if compiled is not None:
             configs = _configs_of(compiled)
-            judgeable = self._judgeable(configs) if configs else []
+            judgeable = self._judgeable(configs, until) if configs else []
             if judgeable:
                 # reuse the entity's own checker when nothing had to be dropped
                 checker = (
@@ -295,7 +329,7 @@ class ConditionEvaluator:
                     return Verdict(False, "automation conditions are not met")
 
         # ---- 3. the conditions on whichever choose branches could match -----
-        return await self._async_branch_verdict(raw, item)
+        return await self._async_branch_verdict(raw, item, until)
 
     def _structural_verdict(
         self, raw: dict[str, Any], item: dict[str, Any]
@@ -327,7 +361,7 @@ class ConditionEvaluator:
         return Verdict(False, "no choose branch runs for this trigger")
 
     async def _async_branch_verdict(
-        self, raw: dict[str, Any], item: dict[str, Any]
+        self, raw: dict[str, Any], item: dict[str, Any], until: Any = None
     ) -> Verdict:
         """False only if every branch this trigger could reach fails its checks.
 
@@ -351,7 +385,7 @@ class ConditionEvaluator:
                 reachable += 1
 
                 others = _strip_trigger_conditions(configs)
-                judgeable = self._judgeable(others)
+                judgeable = self._judgeable(others, until)
                 if not judgeable:
                     return WILL_RUN  # nothing here we could rule it out on
                 checker = await self._checker(judgeable)

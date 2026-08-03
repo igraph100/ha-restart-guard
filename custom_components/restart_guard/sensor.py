@@ -20,6 +20,9 @@ from homeassistant.util import dt as dt_util
 
 from .calc import (
     AutomationInfo,
+    key_match as _key_match,
+    next_change_from_attributes,
+    as_boolean,
     as_list,
     compute,
     soonest_ahead,
@@ -27,6 +30,7 @@ from .calc import (
     sun_slots,
     time_window_from_conditions,
     trigger_kind,
+    two_valued_edge,
     window_from_attributes,
     weekdays_from_conditions,
 )
@@ -56,18 +60,29 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = dt.timedelta(seconds=30)
 AUTOMATION_DOMAIN = "automation"
-# how many upcoming runs to carry in the attributes; the banner lists six
+# How many upcoming runs to carry in the attributes. Far more than the banner
+# shows, because `items` is also what people template against; `count` stays
+# truthful either way, so nothing is misled by the trim.
 MAX_ITEMS = 100
 
 # `sun.sun` publishes the same times the sun trigger is scheduled from
 SUN_ENTITY = "sun.sun"
 SUN_ATTRIBUTES = {"sunrise": "next_rising", "sunset": "next_setting"}
 
-# A `state` trigger is normally unknowable. The native jewish_calendar
-# integration is an exception: every one of its entities schedules its own
-# re-evaluation, and the moments it schedules against are published as sensors.
-# The two tables below are those schedules, transcribed from the integration's
-# `next_update_fn` (sensor.py) and `_update_times` (binary_sensor.py).
+# A `state` trigger is normally unknowable. Calendar integrations are the
+# exception: every one of their entities schedules its own re-evaluation, and
+# the moments they schedule against are published as timestamp sensors in the
+# same config entry. So the entity's next change can be read off its siblings.
+#
+# Three tables describe one such integration:
+#   edges    - entity -> the moments it turns on and off. Direction known, so
+#              `to:` and `from:` resolve exactly.
+#   changes  - entity -> the moments it is recomputed. Direction unknown, so a
+#              directional trigger is only answerable when the entity is
+#              two-valued and its current value gives the direction away.
+#   default  - the same, for every other two-valued entity of that platform.
+#              A table with one row per entity does not survive an integration
+#              with a hundred and sixty of them.
 JEWISH_CALENDAR = "jewish_calendar"
 CANDLE_KEY = "upcoming_candle_lighting"
 HAVDALAH_KEY = "upcoming_havdalah"
@@ -103,6 +118,117 @@ JEWISH_KEYS = sorted(
 )
 
 
+# --------------------------------------------------------------------------
+# YidCal (https://github.com/igraph100/YidCal)
+# --------------------------------------------------------------------------
+# Same idea, one integration further. YidCal publishes its zmanim as timestamp
+# sensors in its own config entry, and every one of its binary sensors is
+# recomputed at one of them.
+#
+# Most of them need nothing here: they publish a `Window_Start`/`Window_End`
+# pair, which `window_from_attributes` reads first and which is better than
+# anything a table could say. This exists for the ones that publish no window
+# at all - and that is the large half, because the ~130 mirrors of
+# `sensor.yidcal_holiday`'s flags carry no attributes whatsoever.
+YIDCAL = "yidcal"
+YIDCAL_EREV = "zman_erev"            # candle lighting
+YIDCAL_MOTZI = "zman_motzi"          # havdalah
+YIDCAL_SHKIA = "zman_shkia"          # sunset: the Hebrew date rolls, so do the flags
+YIDCAL_ALOS = "alos"
+YIDCAL_CHATZOS_DAY = "chatzos_hayom"
+YIDCAL_CHATZOS_NIGHT = "chatzos_haleila"
+
+# Where a family clearly turns over somewhere other than the day boundary.
+# Kept short on purpose: a wrong entry here is a warning at the wrong minute,
+# while a missing one just falls through to the default below.
+YIDCAL_CHANGES: dict[str, tuple[str, ...]] = {
+    "erev_after_chatzos": (YIDCAL_CHATZOS_DAY, YIDCAL_EREV),
+    "erev_tisha_bav_after_chatzos": (YIDCAL_CHATZOS_DAY, YIDCAL_SHKIA),
+    "tisha_bav_night": (YIDCAL_SHKIA, YIDCAL_MOTZI),
+    # Nothing else. Two rows that used to live here were wrong, and both are
+    # worth remembering rather than quietly deleting:
+    #
+    #   slichos          - turns on at havdalah and off at candle lighting,
+    #                      which is `YIDCAL_DEFAULT` already. The row named
+    #                      chatzos haleila and alos, neither of which is an
+    #                      edge of it.
+    #   longer_shachris  - runs 04:00 to 14:00 on the civil clock, so it has no
+    #                      zman edges at all and cannot be expressed here. It
+    #                      publishes its own window, which is the right answer.
+    #
+    # The comment above about a wrong entry costing a warning at the wrong
+    # minute was written before either of those existed, and both proved it.
+}
+
+# Everything else: the day boundary. These are the four moments a flag can turn
+# over on, and they are the same four YidCal itself walks when it works out a
+# flag's window.
+#
+# Alos is in the list for a reason worth stating. Without it, a flag that turns
+# over at dawn has no boundary before it, so the soonest is the *next
+# evening* - asked at 02:00 about a 04:50 flip, the answer came back 20:05.
+# Predicting late is the one answer this must never give: it reads as "safe to
+# restart" for the fifteen hours in between, which is exactly the missed run
+# the whole integration exists to prevent. Predicting early costs a warning
+# nobody needed. The two errors are not the same size.
+YIDCAL_DEFAULT = (YIDCAL_EREV, YIDCAL_MOTZI, YIDCAL_SHKIA, YIDCAL_ALOS)
+
+YIDCAL_KEYS = sorted(YIDCAL_CHANGES, key=len, reverse=True)
+
+
+# Kept per platform rather than pooled: two integrations are free to use the
+# same suffix for moments of different kinds, and a shared set would silently
+# apply one's rule to the other.
+JEWISH_EVENT_KEYS = frozenset({CANDLE_KEY, HAVDALAH_KEY})
+YIDCAL_EVENT_KEYS = frozenset({YIDCAL_EREV, YIDCAL_MOTZI})
+
+# platform -> (edges, changes, default, keys). `default` is only ever applied
+# to something two-valued: a binary sensor, or a boolean attribute.
+BOUNDARY_PLATFORMS: dict[
+    str, tuple[dict, dict, tuple[str, ...] | None, list[str], frozenset[str]]
+] = {
+    JEWISH_CALENDAR: (
+        JEWISH_EDGES, JEWISH_CHANGES, None, JEWISH_KEYS, JEWISH_EVENT_KEYS,
+    ),
+    YIDCAL: (
+        {}, YIDCAL_CHANGES, YIDCAL_DEFAULT, YIDCAL_KEYS, YIDCAL_EVENT_KEYS,
+    ),
+}
+
+# Domains the per-platform default is applied to. A calendar integration's
+# sensors and binary sensors are its output and all turn over on the day
+# boundary; its `select`/`time`/`number` entities are configuration surfaces
+# that change when somebody edits them, and predicting a zman for those would
+# be noise.
+PREDICTED_DOMAINS = ("binary_sensor", "sensor")
+
+# An integration that publishes a row of flags as attributes may also publish
+# one entity per flag. That entity knows its own window when the row it came
+# from does not, so an `attribute:` trigger can be answered exactly instead of
+# from the day boundary - but only if the two can be matched up. These are the
+# two attributes a mirror uses to say what it mirrors. Deliberately a
+# convention rather than a lookup table: any integration can adopt it, and
+# nothing here has to know the integration exists.
+MIRROR_SOURCE_ENTITY = "source_entity"
+MIRROR_SOURCE_ATTRIBUTE = "source_attribute"
+
+# Sentinel: this entity is rebuilt at local midnight rather than at any of the
+# integration's published moments. A timestamp sensor holds one day's zman -
+# `sensor.yidcal_zman_erev` is tonight's candle lighting - so it changes when
+# the day rolls over, not when the zman it names arrives. Predicting sunset for
+# it would be the wrong minute every single time.
+MIDNIGHT: tuple[str, ...] = ("__midnight__",)
+
+# Which published moments may be rolled forward when they have already passed.
+#
+# A solar zman recurs every day, so today's sunset that has already happened is
+# tomorrow's to within a minute, and rolling it forward is right. A moment tied
+# to an *event* is not like that: last Friday's candle lighting rolled forward
+# a day is a Saturday evening that means nothing, and a boundary invented that
+# way is a warning at a minute when nothing happens. Those are only used while
+# they are still ahead of us.
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -131,7 +257,7 @@ class RestartGuardSensor(SensorEntity):
         self._items: list[dict[str, Any]] = []
         self._skipped: list[dict[str, Any]] = []
         self._running: list[dict[str, Any]] = []
-        self._conditions = ConditionEvaluator(hass)
+        self._conditions = ConditionEvaluator(hass, self._changes_before)
         self._schedules_scanned = 0
         self._schedule_source = "not checked"
         self._value: float = NOTHING_DUE
@@ -139,6 +265,10 @@ class RestartGuardSensor(SensorEntity):
         self._scanned = 0
         self._total = 0
         self._trigger_kinds: dict[str, int] = {}
+        self._predictions: dict[str, int] = {}
+        self._prediction_log: list[dict[str, Any]] = []
+        self._mirrors: dict[tuple[str, str], Any] | None = None
+        self._declares: dict[str, bool] = {}
 
     # -- options ----------------------------------------------------------
     @property
@@ -180,6 +310,18 @@ class RestartGuardSensor(SensorEntity):
             # what kinds of trigger were actually seen, so "it isn't warning me"
             # can be told apart from "it never saw that trigger at all"
             "trigger_kinds": self._trigger_kinds,
+            # how `state` / `attribute` triggers were resolved: read off the
+            # entity's own window, off its integration's published moments, off
+            # a boolean attribute, or not at all
+            "state_predictions": self._predictions,
+            # `attribute:` triggers that produced no answer, and why. Empty is
+            # the healthy state: a trigger that resolved is already counted in
+            # `state_predictions` and needs no row here, and this is written to
+            # the recorder on every update. So it costs nothing until something
+            # is actually wrong, and then it says which link broke - the
+            # attribute name, the value's type, the trigger's `to:`, or the
+            # moment itself.
+            "state_debug": self._prediction_log,
             "schedules_scanned": self._schedules_scanned,
             "schedule_conditions": self._schedule_source,
             "error": self._error,
@@ -189,6 +331,10 @@ class RestartGuardSensor(SensorEntity):
         """Recalculate. Runs in the event loop, so keep it cheap."""
         now = dt_util.now()
         try:
+            self._predictions = {}
+            self._prediction_log = []
+            self._mirrors = None
+            self._declares = {}
             self._running = self._collect_running(now)
         except Exception:  # noqa: BLE001 - never let this break the sensor
             _LOGGER.exception("Restart Guard could not read in-progress runs")
@@ -206,6 +352,9 @@ class RestartGuardSensor(SensorEntity):
                 self._option(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL),
                 self._state_change_next,
                 self._calendar_moment,
+                self._attribute_change_next,
+                self._pending_for_next,
+                self._timer_finishes,
             )
         except Exception as err:  # noqa: BLE001 - a bad automation must not kill the sensor
             _LOGGER.exception("Restart Guard could not work out the next run")
@@ -500,32 +649,292 @@ class RestartGuardSensor(SensorEntity):
         turns_on, turns_off = window_from_attributes(
             state.attributes, self._parse_moment
         )
-        if turns_on or turns_off:
-            return state_edge(to_state, from_state, turns_on, turns_off, now)
+        # Some entities skip the window and name the single moment they next
+        # change: a `schedule.*` helper's `next_event`, a running `timer.*`'s
+        # `finishes_at`. Both are two-valued, so that moment plus the value
+        # held now is a complete answer.
+        announced = next_change_from_attributes(
+            state.attributes, self._parse_moment
+        )
+        if announced is not None and announced > now:
+            current = as_boolean(state.state)
+            self._count_prediction("window")
+            if current is None:
+                return None if (to_state or from_state) else announced
+            return two_valued_edge(current, to_state, from_state, announced)
 
-        # 2. its integration publishes the moments instead
-        key, entry = self._jewish_key(entity_id)
-        if key is None:
+        declared = bool(state.attributes.get(MIRROR_SOURCE_ATTRIBUTE))
+        if turns_on or turns_off:
+            answer = state_edge(to_state, from_state, turns_on, turns_off, now)
+            # A *half* window is enough to get here: an entity that publishes
+            # only an end has nothing to say about `to: "on"`, and returning
+            # that silence would drop a run the boundary table could still have
+            # placed. So only a real answer - or an entity that declares itself
+            # a mirror, and is therefore the authority on its own flag - stops
+            # here. Everything else falls through.
+            if answer is not None or declared:
+                self._count_prediction("window" if answer else "no edge")
+                return answer
+
+        # A declared mirror publishing nothing means "looked ahead, no edge",
+        # which beats anything the day boundary could guess. Without that, this
+        # would warn about Sukkos at every sunset in August.
+        elif declared:
+            self._count_prediction("no edge")
             return None
 
-        edges = JEWISH_EDGES.get(key)
+        # 2. its integration publishes the moments instead
+        entry, edges, keys = self._boundary_plan(entity_id)
+        if entry is None:
+            self._count_prediction("unresolved")
+            return None
+
         if edges is not None:
+            self._count_prediction("boundary")
             return state_edge(
                 to_state, from_state,
                 self._soonest(entry, edges["on"], now),
                 self._soonest(entry, edges["off"], now),
                 now,
             )
-
-        keys = JEWISH_CHANGES.get(key)
         if keys is None:
+            self._count_prediction("unresolved")
             return None
-        # We know when this changes, not what it changes to. A `to:` naming a
-        # particular holiday would then be reported every single evening, which
-        # is noise - and a banner you learn to ignore protects nobody.
+
+        self._count_prediction("boundary")
+        moment = self._boundary_moment(entry, keys, now)
+
+        # We know when this is recomputed, not what to. When the entity has
+        # only two values that is enough anyway - `off` now can only become
+        # `on` - so the direction is recovered from the current value.
+        current = as_boolean(state.state)
+        if current is not None:
+            return two_valued_edge(current, to_state, from_state, moment)
+
+        # Otherwise a `to:` naming one particular value would be reported every
+        # single evening, which is noise - and a banner you learn to ignore
+        # protects nobody.
         if to_state is not None or from_state is not None:
             return None
-        return self._soonest(entry, keys, now)
+        return moment
+
+    def _attribute_change_next(
+        self, entity_id: str, attribute: str, to_state: Any, from_state: Any
+    ) -> dt.datetime | None:
+        """When a two-valued attribute next flips, if it can be known.
+
+        A row of boolean attributes is a common way to publish a set of flags
+        that are all recomputed together - one attribute per holiday, per day
+        type, per mode. Watching one of those with an `attribute:` trigger is
+        as predictable as watching the entity itself, and rather better: the
+        flag has only two values, so the one it holds now says which way the
+        next change has to go.
+
+        An attribute holding anything else returns None, exactly as every
+        `attribute:` trigger did before this existed.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        current = as_boolean(state.attributes.get(attribute))
+        if current is None:
+            self._count_prediction("unresolved")
+            return None
+
+        now = dt_util.now()
+
+        # Best case: something mirrors this exact flag and publishes its
+        # window. Then there is nothing to estimate - the mirror holds the
+        # minute the flag turns over, and because the flag has two values the
+        # next change is a start or an end depending on which it holds now.
+        mirror = self._mirror_for(entity_id, attribute)
+        if mirror is not None:
+            starts, ends = window_from_attributes(
+                mirror.attributes, self._parse_moment
+            )
+            edges = ends if current else starts
+            exact = min((edge for edge in edges if edge > now), default=None)
+            if exact is None:
+                # the mirror exists and publishes nothing, so there is no edge
+                # ahead worth reporting - see above, this is an answer
+                self._count_prediction("no edge")
+                return None
+            if exact is not None:
+                answer = two_valued_edge(current, to_state, from_state, exact)
+                self._count_prediction("attribute" if answer else "ruled out")
+                if answer is None and len(self._prediction_log) < 10:
+                    self._prediction_log.append({
+                        "entity_id": entity_id, "attribute": attribute,
+                        "reads": state.attributes.get(attribute),
+                        "parsed_as": current, "wants_to": to_state,
+                        "wants_from": from_state, "via": mirror.entity_id,
+                        "found": exact.isoformat(), "answer": None,
+                    })
+                return answer
+
+        # Otherwise fall back to when the entity is next recomputed. Both
+        # sources count, soonest wins: a window attribute describes when the
+        # *state* turns over, which is not necessarily when a flag does, so
+        # preferring one would be a guess and the sooner errs early.
+        candidates: list[dt.datetime | None] = []
+        turns_on, turns_off = window_from_attributes(
+            state.attributes, self._parse_moment
+        )
+        candidates += [moment for moment in turns_on + turns_off if moment > now]
+
+        entry, edges, keys = self._boundary_plan(entity_id)
+        if entry is not None:
+            if edges is not None:
+                keys = tuple(edges.get("on", ())) + tuple(edges.get("off", ()))
+            if keys:
+                candidates.append(self._boundary_moment(entry, keys, now))
+
+        moment = min(
+            (found for found in candidates if found is not None), default=None
+        )
+        answer = two_valued_edge(current, to_state, from_state, moment)
+        if moment is None:
+            self._count_prediction("unresolved")
+        else:
+            self._count_prediction("attribute" if answer else "ruled out")
+        # Only the ones that came back empty-handed. A resolved trigger is
+        # visible in `items` and counted in `state_predictions` already.
+        if answer is None and len(self._prediction_log) < 10:
+            self._prediction_log.append({
+                "entity_id": entity_id,
+                "attribute": attribute,
+                "reads": state.attributes.get(attribute),
+                "parsed_as": current,
+                "wants_to": to_state,
+                "wants_from": from_state,
+                "found": moment.isoformat() if moment else None,
+                "answer": answer.isoformat() if answer else None,
+            })
+        return answer
+
+    def _uses_mirrors(self, config_entry_id: Any) -> bool:
+        """Does this integration publish per-flag mirrors that declare themselves?
+
+        It decides how far the per-platform default can be trusted. Where the
+        convention is in use, every flag that is about to turn on says so in
+        its own window, and the default is only ever reached by the handful of
+        entities that genuinely do turn over on the day boundary.
+
+        Where it is not - an older version of the same integration - there is
+        no way to tell a flag that comes on at tonight's candle lighting from
+        one that comes on in eight months. Both read `off` and publish nothing.
+        Answering the second with "the next boundary" is a countdown attached
+        to an automation that will not run, which is worse than the silence
+        this gave before the default existed.
+        """
+        if config_entry_id in self._declares:
+            return self._declares[config_entry_id]
+        found = False
+        try:
+            registry = er.async_get(self.hass)
+            for other in er.async_entries_for_config_entry(
+                registry, config_entry_id
+            ):
+                state = self.hass.states.get(other.entity_id)
+                if state is not None and state.attributes.get(
+                    MIRROR_SOURCE_ATTRIBUTE
+                ):
+                    found = True
+                    break
+        except Exception:  # noqa: BLE001 - assume the older shape
+            found = False
+        self._declares[config_entry_id] = found
+        return found
+
+    def _mirror_for(self, entity_id: str, attribute: str) -> Any:
+        """The entity that declares itself the mirror of this attribute.
+
+        Built once per update and only when something actually asks, since an
+        install with no `attribute:` triggers should never pay for it.
+        """
+        if self._mirrors is None:
+            self._mirrors = {}
+            for state in self.hass.states.async_all():
+                attrs = state.attributes
+                source = attrs.get(MIRROR_SOURCE_ENTITY)
+                flag = attrs.get(MIRROR_SOURCE_ATTRIBUTE)
+                if source and flag:
+                    self._mirrors.setdefault((str(source), str(flag)), state)
+        return self._mirrors.get((entity_id, attribute))
+
+    def _pending_for_next(
+        self, entity_id: str, to_state: Any, from_state: Any, seconds: int
+    ) -> dt.datetime | None:
+        """When a `state ... for:` trigger fires, counting the delay.
+
+        Two cases, and the first is the one that matters. If the entity is
+        *already* sitting in the state being waited on, the countdown is
+        running right now and completes at `last_changed + for` - and Home
+        Assistant throws that countdown away on restart, so the run is lost
+        silently. If it is not there yet, the run is the predicted change plus
+        the delay, which is only knowable when the change itself is.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        held = dt.timedelta(seconds=seconds)
+        now = dt_util.now()
+
+        wanted = to_state if to_state is not None else None
+        matches = wanted is None or any(
+            str(value).lower() == str(state.state).lower()
+            for value in as_list(wanted)
+        )
+        if matches and state.last_changed is not None:
+            since = dt_util.as_local(state.last_changed)
+            done = since + held
+            if done > now:
+                self._count_prediction("pending for")
+                # `last_changed` carries microseconds; every other prediction
+                # here is a whole second, and the banner shows minutes
+                return done.replace(microsecond=0)
+
+        change = self._state_change_next(entity_id, to_state, from_state)
+        return None if change is None else change + held
+
+    def _timer_finishes(self, entity_id: str) -> dt.datetime | None:
+        """When a running timer reaches zero.
+
+        A timer does not survive a restart either, so this is worth the same
+        warning a clock trigger gets.
+        """
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state != "active":
+            return None
+        moment = self._parse_moment(state.attributes.get("finishes_at"))
+        if moment is not None:
+            self._count_prediction("timer")
+        return moment
+
+    def _changes_before(self, entity_id: str, until: dt.datetime) -> bool:
+        """Does this entity change between now and `until`?
+
+        Reuses the same prediction the triggers use, so anything Restart Guard
+        can foresee a trigger on it can also foresee a condition on. The
+        counters are restored afterwards: these lookups are bookkeeping for the
+        condition check and would otherwise inflate `state_predictions`.
+        """
+        saved = dict(self._predictions)
+        try:
+            moment = self._state_change_next(entity_id, None, None)
+        except Exception:  # noqa: BLE001 - unknowable means it might move
+            return True
+        finally:
+            self._predictions = saved
+        return moment is not None and moment <= until
+
+    def _count_prediction(self, outcome: str) -> None:
+        """Tally how each state/attribute trigger was resolved, as a diagnostic.
+
+        Same purpose as `trigger_kinds`: \"it isn't warning me\" needs to tell
+        \"read, and not due\" apart from \"never resolved at all\".
+        """
+        self._predictions[outcome] = self._predictions.get(outcome, 0) + 1
 
     def _calendar_moment(self, entity_id: str, which: str) -> dt.datetime | None:
         """When the event this calendar is on, or waiting for, starts or ends.
@@ -539,17 +948,64 @@ class RestartGuardSensor(SensorEntity):
         key = "end_time" if which == "end" else "start_time"
         return self._parse_moment(state.attributes.get(key))
 
-    def _jewish_key(self, entity_id: str) -> tuple[str | None, Any]:
-        """Which jewish_calendar entity this is, and its registry entry."""
+    def _boundary_plan(
+        self, entity_id: str
+    ) -> tuple[Any, dict[str, tuple[str, ...]] | None, tuple[str, ...] | None]:
+        """How to predict this entity's next change from its own integration.
+
+        Returns (registry entry, on/off moments, any-change moments). The
+        entity is matched on its unique_id, not its entity_id, so renaming it
+        changes nothing.
+
+        The per-platform default covers whatever the table does not name, so a
+        calendar integration with a hundred and sixty entities does not need a
+        hundred and sixty rows. Timestamp sensors are split off to midnight,
+        and domains outside `PREDICTED_DOMAINS` get nothing.
+        """
         registry = er.async_get(self.hass)
         entry = registry.async_get(entity_id)
-        if entry is None or entry.platform != JEWISH_CALENDAR:
-            return None, None
-        name = f"{entry.unique_id or ''}|{entity_id}"
-        for key in JEWISH_KEYS:
-            if name.endswith(key):
-                return key, entry
-        return None, None
+        if entry is None:
+            return None, None, None
+        table = BOUNDARY_PLATFORMS.get(entry.platform)
+        if table is None:
+            return None, None, None
+
+        edges, changes, default, keys, _events = table
+        key = _key_match(entry.unique_id, entity_id, keys)
+        if key is not None:
+            if key in edges:
+                return entry, edges[key], None
+            return entry, None, changes[key]
+
+        if default is None or entity_id.split(".", 1)[0] not in PREDICTED_DOMAINS:
+            return None, None, None
+
+        state = self.hass.states.get(entity_id)
+        device_class = state.attributes.get("device_class") if state else None
+        if str(device_class or "") == "timestamp":
+            return entry, None, MIDNIGHT
+
+        # Without the mirror convention, a two-valued entity that is currently
+        # off tells us nothing about *which* boundary turns it on - see
+        # `_uses_mirrors`. One that is on is a different matter: these windows
+        # are short, so the next boundary really is where it ends.
+        if (
+            state is not None
+            and as_boolean(state.state) is False
+            and not self._uses_mirrors(getattr(entry, "config_entry_id", None))
+        ):
+            return None, None, None
+        return entry, None, default
+
+    def _boundary_moment(
+        self, entry: Any, keys: tuple[str, ...], now: dt.datetime
+    ) -> dt.datetime | None:
+        """The next moment this entity is recomputed."""
+        if keys is MIDNIGHT:
+            return (now + dt.timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        return self._soonest(entry, keys, now)
 
     def _soonest(
         self, entry: Any, keys: tuple[str, ...], now: dt.datetime
@@ -558,14 +1014,28 @@ class RestartGuardSensor(SensorEntity):
         if entry is None:
             return None
         registry = er.async_get(self.hass)
-        found: list[dt.datetime | None] = []
+        table = BOUNDARY_PLATFORMS.get(getattr(entry, "platform", ""))
+        event_keys = table[4] if table else frozenset()
+        recurring: list[dt.datetime | None] = []
+        one_off: list[dt.datetime] = []
         for other in er.async_entries_for_config_entry(
             registry, entry.config_entry_id
         ):
-            name = f"{other.unique_id or ''}|{other.entity_id}"
-            if any(name.endswith(key) for key in keys):
-                found.append(self._entity_moment(other.entity_id))
-        return soonest_ahead(found, now)
+            key = _key_match(other.unique_id, other.entity_id, keys)
+            if key is None:
+                continue
+            moment = self._entity_moment(other.entity_id)
+            if moment is None:
+                continue
+            if key in event_keys:
+                if moment > now:
+                    one_off.append(moment)
+            else:
+                recurring.append(moment)
+
+        candidates = one_off + [soonest_ahead(recurring, now)]
+        ahead = [moment for moment in candidates if moment is not None]
+        return min(ahead) if ahead else None
 
     def _entity_moment(self, entity_id: str) -> dt.datetime | None:
         """A timestamp entity's value."""
