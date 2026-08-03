@@ -24,6 +24,12 @@ ResolveEntity = Callable[[str], "dt.time | dt.datetime | None"]
 SunNext = Callable[[str, int], "dt.datetime | None"]
 # (entity_id, to, from) -> when that state change next happens
 StateNext = Callable[[str, Any, Any], "dt.datetime | None"]
+# (entity_id, attribute, to, from) -> when that attribute next flips
+AttributeNext = Callable[[str, str, Any, Any], "dt.datetime | None"]
+# (entity_id, to, from, seconds) -> when a `for:` countdown completes
+PendingNext = Callable[[str, Any, Any, int], "dt.datetime | None"]
+# (entity_id) -> when a timer finishes
+TimerNext = Callable[[str], "dt.datetime | None"]
 # (entity_id, "start"|"end") -> when the calendar event begins or ends
 CalendarNext = Callable[[str, str], "dt.datetime | None"]
 
@@ -75,6 +81,21 @@ def trigger_field(trigger: Any, name: str) -> Any:
             if found is not None:
                 return found
     return None
+
+
+def as_text(value: Any) -> str:
+    """The literal behind a validated config value.
+
+    Home Assistant runs an event trigger's `event_type` and `event_data`
+    through `cv.template`, so `event_type: timer.finished` arrives as a
+    Template object rather than the string that was written - and `str()` on
+    one gives its repr, not its contents. Anything without a template inside is
+    returned unchanged.
+    """
+    inner = getattr(value, "template", None)
+    if isinstance(inner, str):
+        return inner
+    return str(value)
 
 
 def as_list(value: Any) -> list[Any]:
@@ -270,6 +291,44 @@ def window_from_attributes(
     return sorted(starts), sorted(ends)
 
 
+def key_match(unique_id: Any, entity_id: str, keys: Iterable[str]) -> str | None:
+    """The first of these keys the entity's unique_id or entity_id ends in.
+
+    Both are tested, separately and deliberately. An integration does not have
+    to keep the two in step - YidCal's sunset sensor has the unique_id
+    `yidcal_zman_shkia` and the entity_id `sensor.yidcal_shkia` - and joining
+    them into one string only ever tests whichever half happens to be last.
+    The unique_id is the one that survives a rename, so it is tried first.
+    """
+    unique = str(unique_id or "")
+    object_id = entity_id.split(".", 1)[-1]
+    for key in keys:
+        if unique.endswith(key) or object_id.endswith(key):
+            return key
+    return None
+
+
+# Attributes that name the single moment an entity next changes, rather than a
+# window around it. A `schedule.*` helper publishes `next_event`; a running
+# `timer.*` publishes `finishes_at`. Both are two-valued, so the moment plus
+# the value held now is a complete answer.
+_NEXT_CHANGE_KEYS = ("next_event", "finishes_at")
+
+
+def next_change_from_attributes(
+    attributes: Any, parse: Callable[[Any], "dt.datetime | None"]
+) -> "dt.datetime | None":
+    """The moment this entity says it next changes, if it says so at all."""
+    if not isinstance(attributes, dict):
+        return None
+    for key, value in attributes.items():
+        if str(key).lower() in _NEXT_CHANGE_KEYS:
+            moment = parse(value)
+            if moment is not None:
+                return moment
+    return None
+
+
 def soonest_ahead(
     candidates: Iterable["dt.datetime | None"], now: dt.datetime
 ) -> "dt.datetime | None":
@@ -280,12 +339,25 @@ def soonest_ahead(
     value rolls forward a day rather than being discarded. A day's drift on a
     solar time is about a minute, far finer than this needs. Times that are
     already in the future are taken as they are.
+
+    One day is the whole allowance. A value older than that is not a sunset we
+    can roll forward, it is an entity that has stopped updating - after a clock
+    change, a failed refresh, an integration that only recomputes at midnight.
+    Rolling *that* forward a day lands on a moment still in the past, which
+    reads as a real answer here and is then dropped further downstream for
+    being behind `now`: a prediction that vanishes with nothing to show for
+    itself. Better to have no answer than a wrong one that hides.
     """
     ahead = []
     for moment in candidates:
         if moment is None:
             continue
-        ahead.append(moment if moment > now else moment + dt.timedelta(days=1))
+        if moment > now:
+            ahead.append(moment)
+            continue
+        rolled = moment + dt.timedelta(days=1)
+        if rolled > now:
+            ahead.append(rolled)
     return min(ahead) if ahead else None
 
 
@@ -330,6 +402,89 @@ def state_edge(
         moment for moment in candidates if moment is not None and moment > now
     )
     return ahead[0] if ahead else None
+
+
+# --------------------------------------------------------------------------
+# two-valued states and attributes
+# --------------------------------------------------------------------------
+_TRUE_WORDS = frozenset({"true", "on", "yes"})
+_FALSE_WORDS = frozenset({"false", "off", "no"})
+
+
+def as_boolean(value: Any) -> bool | None:
+    """True / False for something two-valued, None for anything else.
+
+    Deliberately narrow. `1` and `0` are not accepted: a counter that happens
+    to read zero is not a flag, and treating it as one would let ordinary
+    numeric attributes in as \"predictable\" when they are nothing of the kind.
+
+    Strings count, because an integration writing its flags out as attributes
+    routinely writes `\"true\"` rather than `True` - Home Assistant serialises
+    both the same way to the frontend, and neither is more real than the other.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+    return None
+
+
+def _named_boolean(value: Any) -> bool | None:
+    """The single boolean a trigger's `to:` / `from:` names, if it names one.
+
+    A list naming both values, or a value we cannot read, gives None - which
+    the caller treats as \"cannot tell\", never as a licence to guess.
+    """
+    listed = as_list(value)
+    if not listed:
+        return None
+    parsed = {as_boolean(item) for item in listed}
+    if len(parsed) != 1:
+        return None
+    return parsed.pop()
+
+
+def two_valued_edge(
+    current: bool,
+    to_state: Any,
+    from_state: Any,
+    moment: "dt.datetime | None",
+) -> "dt.datetime | None":
+    """When a two-valued thing next satisfies this trigger.
+
+    Something with only two values gives its own direction away. If it reads
+    `on` now, the only change it can make is to `off` - so `to: \"off\"`
+    resolves to ``moment`` and `to: \"on\"` cannot be reached by the next change
+    at all and returns nothing.
+
+    That is worth more than it looks. Elsewhere, knowing *when* an entity is
+    re-evaluated without knowing *what to* means every directional trigger has
+    to be dropped as unknowable - and `to: \"on\"` is how people actually write
+    them, so that is nearly all of them. Here the current value supplies the
+    missing half: one direction is answered, and the other is ruled out for
+    free instead of being warned about.
+    """
+    if moment is None:
+        return None
+    if to_state is None and from_state is None:
+        return moment  # any change counts
+
+    becomes = not current  # the value the next change must produce
+
+    wanted = _named_boolean(to_state)
+    if wanted is not None:
+        return moment if wanted == becomes else None
+
+    # no readable `to:`, so `from:` decides by implication
+    left = _named_boolean(from_state)
+    if left is not None:
+        return moment if left == current else None
+
+    return None  # a `to:` we cannot read is not an invitation to guess
 
 
 def pattern_hit(value: int, spec: Any) -> bool:
@@ -462,6 +617,9 @@ def trigger_slots(
     window: tuple[dt.time, dt.time] | None = None,
     state_next: StateNext | None = None,
     calendar_next: CalendarNext | None = None,
+    attribute_next: AttributeNext | None = None,
+    pending_next: PendingNext | None = None,
+    timer_next: TimerNext | None = None,
 ) -> list[dt.datetime]:
     """Candidate fire times for a single trigger."""
     kind = trigger_kind(trigger)
@@ -496,6 +654,28 @@ def trigger_slots(
         moment = sun_next(event, parse_offset(trigger_field(trigger, "offset")))
         return [moment] if moment else []
 
+    if kind == "event":
+        # `timer.finished` is a clock event wearing an event trigger's clothes:
+        # the timer publishes `finishes_at`, and Home Assistant destroys a
+        # running timer on restart, so a missed one leaves nothing behind.
+        if timer_next is None:
+            return []
+        events = [as_text(e) for e in as_list(trigger_field(trigger, "event_type"))]
+        if "timer.finished" not in events:
+            return []
+        data = trigger_field(trigger, "event_data")
+        slots = []
+        for entity_id in as_list(
+            (data or {}).get("entity_id") if isinstance(data, dict) else None
+        ):
+            entity_id = as_text(entity_id)
+            if not is_entity_id(entity_id):
+                continue
+            moment = timer_next(entity_id)
+            if moment is not None:
+                slots.append(moment)
+        return slots
+
     if kind in CALENDAR_KINDS:
         # A calendar entity publishes the start and end of the event it is on
         # or waiting for, so a run driven by one is as knowable as a clock.
@@ -524,15 +704,57 @@ def trigger_slots(
         # some entities announce when they next change, and those runs are as
         # predictable as any clock. Anything we cannot resolve returns nothing,
         # exactly as before, so this only ever adds warnings.
+        #
+        # `for:` means the run happens some time *after* the change, and Home
+        # Assistant drops the pending countdown on restart - the run vanishes
+        # with nothing in the log, which is the worst way to lose one. So the
+        # delay is added rather than the trigger being abandoned.
+        held = trigger_field(trigger, "for")
+        if held is not None:
+            if pending_next is None:
+                return []
+            seconds = parse_offset(held)
+            if seconds <= 0:
+                return []
+            wait_slots = []
+            for entity_id in as_list(trigger_field(trigger, "entity_id")):
+                if not is_entity_id(entity_id):
+                    continue
+                moment = pending_next(
+                    str(entity_id),
+                    trigger_field(trigger, "to"),
+                    trigger_field(trigger, "from"),
+                    seconds,
+                )
+                if moment is not None:
+                    wait_slots.append(moment)
+            return wait_slots
+
+        # An attribute trigger watches something other than the state, which
+        # normally puts it out of reach. A *two-valued* attribute is the
+        # exception, and an easy one: an integration that publishes a row of
+        # flags recomputes them all at the same moment it recomputes the state,
+        # and with only two values the one it holds now says which way the next
+        # change must go. Anything else still returns nothing.
+        attribute = trigger_field(trigger, "attribute")
+        if attribute is not None:
+            if attribute_next is None:
+                return []
+            flag_slots = []
+            for entity_id in as_list(trigger_field(trigger, "entity_id")):
+                if not is_entity_id(entity_id):
+                    continue
+                moment = attribute_next(
+                    str(entity_id),
+                    str(attribute),
+                    trigger_field(trigger, "to"),
+                    trigger_field(trigger, "from"),
+                )
+                if moment is not None:
+                    flag_slots.append(moment)
+            return flag_slots
+
         if state_next is None:
-            return []
-        # `for:` means the run happens some time after the change, and Home
-        # Assistant drops that pending countdown on restart. Predicting the
-        # change but not the delay would report the wrong minute, so leave it.
-        if trigger_field(trigger, "for") is not None:
-            return []
-        # an attribute trigger watches something other than the state itself
-        if trigger_field(trigger, "attribute") is not None:
             return []
         slots = []
         for entity_id in as_list(trigger_field(trigger, "entity_id")):
@@ -563,6 +785,9 @@ def compute(
     min_interval: int = 60,
     state_next: StateNext | None = None,
     calendar_next: CalendarNext | None = None,
+    attribute_next: AttributeNext | None = None,
+    pending_next: PendingNext | None = None,
+    timer_next: TimerNext | None = None,
 ) -> list[dict[str, Any]]:
     """Upcoming runs inside the lookahead window, soonest first."""
     horizon = now + dt.timedelta(minutes=lookahead)
@@ -580,7 +805,8 @@ def compute(
                 slots = trigger_slots(
                     trigger, now, tz, lookahead, days,
                     resolve_entity, sun_next, min_interval, auto.window,
-                    state_next, calendar_next,
+                    state_next, calendar_next, attribute_next,
+                    pending_next, timer_next,
                 )
             except Exception:  # noqa: BLE001 - one bad trigger must not kill the sensor
                 # Never silently: a swallowed error here reads exactly like
