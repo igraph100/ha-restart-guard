@@ -1,0 +1,175 @@
+name: Bug report
+description: Restart Guard warned about the wrong thing, or didn't warn at all
+title: "[Bug]: "
+labels: ["bug"]
+
+# Short on purpose, twice over.
+#
+# A form that demands fifteen answers gets fewer reports, not better ones -
+# people give up halfway and the bug is simply never heard about.
+#
+# And once an issue is submitted, GitHub throws the form away and leaves plain
+# markdown behind, so every field somebody skipped becomes a "### Label /
+# _No response_" pair they have to edit around for as long as the issue is
+# open. A field has to earn its place in both directions.
+#
+# Three that didn't: the trigger kind (the `trigger_kinds` attribute already
+# says it, and more reliably than someone guessing), steps to reproduce (the
+# "what happened" box gets the same answer without the ceremony), and a file
+# upload field (the "what happened" box takes drag-and-dropped screenshots
+# already, because it has no `render:`).
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        Nearly every Restart Guard bug comes down to one question: **what did it
+        / didn't it predict, and what actually happened?** The
+        `sensor.restart_guard` attributes answer the first half, which is why
+        they're the one long thing being asked for. Everything below them is
+        optional - fill in what you can and send it.
+
+  # ---------------------------------------------------------------------------
+  # Which way did it get it wrong? The first thing worth knowing, because the
+  # two directions are not equally serious. A warning nobody needed costs a few
+  # seconds. A missing warning cuts off a run that was about to happen, which is
+  # the thing this integration exists to prevent.
+  # ---------------------------------------------------------------------------
+  - type: dropdown
+    id: direction
+    attributes:
+      label: What went wrong?
+      options:
+        - It did NOT warn, and the automation ran anyway (missed warning)
+        - It warned, but the automation was not going to run (unnecessary warning)
+        - It warned, but the details were wrong (wrong time, name, or count)
+        - The banner didn't appear at all
+        - Something else
+    validations:
+      required: true
+
+  # ---------------------------------------------------------------------------
+  # Required, and it earns its place: this is the field that decides whether the
+  # automation YAML below is needed. GitHub forms cannot make one field required
+  # based on another, so the validator workflow does it - and it can only do
+  # that if this was answered. The first four options are the ones where a
+  # report without the YAML cannot be acted on.
+  # ---------------------------------------------------------------------------
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part is involved?
+      description: >
+        Pick the first four only if a specific automation, script or schedule is
+        involved. If it's about where the warning appears or how it looks,
+        that's the banner.
+      options:
+        - A specific automation - when it was predicted to run
+        - A specific automation - one already part-way through a run
+        - A specific automation - its conditions or choose branches
+        - A Scheduler component schedule
+        - The warning banner - where it appears, or how it looks
+        - Tapping a row to open it
+        - Installation, update, or the integration not loading
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: automation
+    attributes:
+      label: The automation, script, or schedule involved
+      description: >
+        **Needed if you picked one of the first four options above** - those
+        can't be looked into without it, and the bot will ask.
+
+        Automation editor → three-dot menu → Edit in YAML, then paste the whole
+        thing. For a Scheduler schedule, the entity's attributes from Developer
+        tools → States do the same job. Please remove anything private.
+      render: yaml
+
+  - type: input
+    id: rg_version
+    attributes:
+      label: Restart Guard version
+      description: >
+        HACS shows this, or read the `version` attribute of
+        `sensor.restart_guard` - that one is authoritative, because it comes
+        from the code actually running.
+      placeholder: "0.0.4"
+    validations:
+      required: true
+
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      description: Settings → About.
+      placeholder: "2026.8.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened, and what did you expect instead?
+      placeholder: |
+        I opened the restart dialog at 23:40 and it said nothing was due, but
+        the automation ran at 23:45 and got cut off. I expected it to warn.
+    validations:
+      required: true
+
+  # ---------------------------------------------------------------------------
+  # Required, and the reason is worth spelling out on the form itself: this is
+  # the only record of what Restart Guard *thought*, and the difference between
+  # "it never saw the trigger" and "it saw it and ruled it out" is otherwise
+  # unguessable from the outside.
+  # ---------------------------------------------------------------------------
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: sensor.restart_guard attributes
+      description: >
+        Developer tools → States → `sensor.restart_guard`, then copy the whole
+        attributes box. The useful ones are `items`, `skipped`, `running`,
+        `trigger_kinds`, `state_predictions` and `state_debug` - please don't
+        trim it down, the empty ones are informative too.
+
+        If the problem is that the banner never appears at all, say so here
+        instead.
+      render: yaml
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: One last thing
+      options:
+        - label: I removed tokens, passwords, and other private information.
+          required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Everything below is optional.** It all helps, but none of it is worth
+        holding the report back for.
+
+  - type: input
+    id: happened_at
+    attributes:
+      label: Roughly when did this happen?
+      description: >
+        Your local time and date. Every prediction is relative to "now", so the
+        times in the attributes above are much easier to read against it.
+      placeholder: "2026-08-03, about 23:40"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        Settings → System → Logs, searching for `restart_guard`.
+      render: text

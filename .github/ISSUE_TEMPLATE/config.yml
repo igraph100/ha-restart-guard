@@ -1,0 +1,31 @@
+# No blank issues: every report goes through a form.
+#
+# The forms are short enough that this isn't much of an imposition, and the
+# alternative is a steady trickle of "doesn't work" with nothing to act on. The
+# links below exist so that the things which are *not* bugs still have an
+# obvious place to go - without them, turning blank issues off just makes
+# people file a bug report about a question.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Is this a bug, or something Restart Guard can't detect?
+    url: https://github.com/igraph100/ha-restart-guard#what-it-cannot-catch
+    about: >
+      Some things are impossible to predict, and the README says which and why.
+      Worth thirty seconds before filing - it may already explain what you saw.
+
+  - name: It stayed quiet and I think it should have warned
+    url: https://github.com/igraph100/ha-restart-guard#when-it-stays-quiet
+    about: >
+      Restart Guard deliberately says nothing about runs that would fire and do
+      nothing. This explains when that happens and how to turn it off.
+
+  - name: How do I change the warning window, lookahead, or other settings?
+    url: https://github.com/igraph100/ha-restart-guard#options
+    about: Every option, what it does, and what it defaults to.
+
+  - name: General Home Assistant help
+    url: https://community.home-assistant.io/
+    about: >
+      For questions about automations, triggers, or Home Assistant itself
+      rather than about Restart Guard.

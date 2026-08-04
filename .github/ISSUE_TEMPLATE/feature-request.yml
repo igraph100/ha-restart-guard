@@ -1,0 +1,54 @@
+name: Feature request
+description: Something Restart Guard should predict, or should do differently
+title: "[Feature]: "
+labels: ["enhancement"]
+
+# Three fields, one of them required.
+#
+# Kept this short on purpose. Once an issue is submitted, GitHub throws the
+# form away and leaves plain markdown behind - so every field somebody skipped
+# becomes a "### Label / _No response_" pair they have to edit around later.
+# A long form doesn't just cost time at submission, it clutters the issue for
+# as long as it's open.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The README's
+        [what it cannot catch](https://github.com/igraph100/ha-restart-guard#what-it-cannot-catch)
+        section splits requests into what's impossible in principle and what's
+        predictable but not built yet. The second kind mostly gets built when
+        somebody asks.
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should it do?
+      description: >
+        What you want added or changed, and what made you want it.
+      placeholder: |
+        Warn when an automation is waiting on a wait_for_trigger that has a
+        timeout - the timeout is a known moment, and restarting loses it.
+
+        I restarted at 19:58 and lost a run that was due at 20:00.
+    validations:
+      required: true
+
+  - type: textarea
+    id: automation
+    attributes:
+      label: The automation or setting this is about
+      description: >
+        If there's a specific one, paste it - a concrete example is far easier
+        to build against than a description. Please remove anything private.
+      render: yaml
+
+  - type: input
+    id: integration
+    attributes:
+      label: If this is about another integration's sensors, link it
+      description: >
+        Whether this is possible at all depends on what that integration
+        publishes and when, so the repository or docs link does most of the
+        work here.
+      placeholder: "https://github.com/..."

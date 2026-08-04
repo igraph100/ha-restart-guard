@@ -1,0 +1,268 @@
+name: Check bug reports
+
+# Reads a new bug report, says what's missing, and labels it. Re-runs on every
+# edit, so the same comment turns into a tick once the gaps are filled.
+#
+# The one thing this must not do is nag somebody who filled the form in
+# properly. That happens when the bot's idea of the form drifts from the actual
+# form - so the section headings are read out of the form YAML at run time
+# rather than written down twice.
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    # Only bug reports, and only other people's. A maintainer opening a
+    # note-to-self issue does not need to be told off by their own bot.
+    if: >
+      startsWith(github.event.issue.title, '[Bug]:') &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/ISSUE_TEMPLATE
+          sparse-checkout-cone-mode: false
+
+      - name: Read the field names out of the form
+        id: form
+        run: |
+          # PyYAML is usually already on the runner. When it isn't, the system
+          # Python on Ubuntu 24.04 is "externally managed" and refuses a plain
+          # install, so the fallback needs the override flag.
+          python3 -c "import yaml" 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, yaml
+
+          with open(".github/ISSUE_TEMPLATE/bug-report.yml", encoding="utf-8") as handle:
+              form = yaml.safe_load(handle)
+
+          # id -> the heading GitHub writes into the issue body for that field
+          fields = {
+              element["id"]: element["attributes"]["label"]
+              for element in form["body"]
+              if element["type"] != "markdown" and element.get("id")
+          }
+          print("fields=" + json.dumps(fields))
+          PY
+
+      - uses: actions/github-script@v8
+        env:
+          FIELDS: ${{ steps.form.outputs.fields }}
+        with:
+          script: |
+            const fields = JSON.parse(process.env.FIELDS);
+            const issue = context.payload.issue;
+            const body = issue.body || "";
+            const marker = "<!-- restart-guard-issue-check -->";
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+
+            // ---------------------------------------------------------------
+            // Reading an answer back out of the issue body
+            // ---------------------------------------------------------------
+            // GitHub throws the form away on submit and leaves markdown behind:
+            // "### <label>" then the answer, until the next "###". Answers from
+            // a `render:` field arrive wrapped in a fenced code block.
+            const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+            // No `m` flag, deliberately. With it, `$` in the lookahead matches
+            // the end of every *line*, so the lazy capture stops at the first
+            // newline - which reads a one-line answer correctly and silently
+            // truncates a pasted code block to nothing. Anchoring with
+            // `(?:^|\n)` instead keeps `$` meaning end of body.
+            function answer(id) {
+              const label = fields[id];
+              if (!label) return "";
+              const section = new RegExp(
+                `(?:^|\\n)### ${escape(label)}\\s*\\n+([\\s\\S]*?)(?=\\n### |$)`
+              );
+              const found = body.match(section);
+              if (!found) return "";
+              return found[1]
+                .replace(/^```[a-zA-Z0-9_-]*\s*/, "")
+                .replace(/\s*```\s*$/, "")
+                .trim();
+            }
+
+            // What someone writes when they have nothing to say. "_No response_"
+            // is GitHub's own filler for a skipped optional field.
+            const blank = (value) => {
+              const text = (value || "").trim().toLowerCase();
+              return !text || ["_no response_", "no response", "n/a", "na",
+                               "none", "-", "nothing"].includes(text);
+            };
+
+            const direction = answer("direction");
+            const area = answer("area");
+            const automation = answer("automation");
+            const rgVersion = answer("rg_version");
+            const haVersion = answer("ha_version");
+            const happened = answer("happened");
+            const diagnostics = answer("diagnostics");
+
+            const missing = [];
+            const notes = [];
+
+            // ---------------------------------------------------------------
+            // Versions
+            // ---------------------------------------------------------------
+            if (!/^v?\d+\.\d+\.\d+/.test(rgVersion)) {
+              missing.push(
+                "**Restart Guard version** should look like `0.0.4` - the `version` " +
+                "attribute on `sensor.restart_guard` is the one to trust, because it " +
+                "comes from the code actually running."
+              );
+            }
+            // 2026.8, 2026.8.1, and betas like 2026.8.0b3 are all real
+            if (!/^\d{4}\.\d{1,2}(\.\d+)?([ab]\d+)?$/.test(haVersion)) {
+              missing.push("**Home Assistant version** should look like `2026.8.0`.");
+            }
+
+            if (blank(happened) || happened.length < 20) {
+              missing.push(
+                "**What happened** needs a bit more - what Restart Guard showed, and " +
+                "what the automation actually did."
+              );
+            }
+
+            // ---------------------------------------------------------------
+            // The attributes are the whole point of the form
+            // ---------------------------------------------------------------
+            // Checked for shape, not just presence: people paste the entity's
+            // state (a number) rather than its attributes, and that reads as
+            // filled in while telling us nothing.
+            if (blank(diagnostics)) {
+              missing.push(
+                "**The `sensor.restart_guard` attributes** are missing. Developer " +
+                "tools → States → `sensor.restart_guard`, then copy the whole " +
+                "attributes box - this is the only record of what Restart Guard " +
+                "predicted, so almost nothing can be worked out without it."
+              );
+            } else if (!/restart_guard|trigger_kinds|state_predictions|lookahead/.test(diagnostics)) {
+              missing.push(
+                "**The `sensor.restart_guard` attributes** don't look like the full " +
+                "attribute block - it should contain things like `trigger_kinds` and " +
+                "`lookahead`. The state on its own (a number of minutes) isn't enough."
+              );
+            }
+
+            // ---------------------------------------------------------------
+            // The automation, when the report is about one
+            // ---------------------------------------------------------------
+            // Keyed off how the option is worded, so adding another
+            // automation-shaped option to the form needs no change here.
+            const aboutAnAutomation = /^A specific automation|^A Scheduler/.test(area);
+            if (aboutAnAutomation && blank(automation)) {
+              missing.push(
+                `You picked "${area}", so **the automation or schedule itself** is ` +
+                "needed - the prediction can't be reproduced without the triggers and " +
+                "conditions it was made from."
+              );
+            }
+            if (!area) {
+              missing.push("**Which part is involved** wasn't answered.");
+            }
+
+            // ---------------------------------------------------------------
+            // Newer release available? Worth mentioning, not worth blocking on.
+            // A real bug on 0.0.4 is usually still a real bug on 0.0.5, and
+            // turning people away means never hearing about it.
+            // ---------------------------------------------------------------
+            let outdated = false;
+            let latest = null;
+            try {
+              const release = await github.rest.repos.getLatestRelease(repo);
+              latest = release.data.tag_name;
+              const plain = (v) => v.trim().toLowerCase().replace(/^v/, "");
+              if (rgVersion && latest && plain(rgVersion) !== plain(latest)) {
+                outdated = true;
+                notes.push(
+                  `You're on \`${rgVersion}\` and the latest release is \`${latest}\`. ` +
+                  "Worth trying that first if you can - it may already be fixed. If it " +
+                  "still happens, say so here and this stays open either way."
+                );
+              }
+            } catch (error) {
+              console.log("No release to compare against:", error.message);
+            }
+
+            // ---------------------------------------------------------------
+            // Labels
+            // ---------------------------------------------------------------
+            const palette = [
+              // `bug` is applied by the form itself, but GitHub silently drops
+              // a label that doesn't exist - so make sure it does.
+              ["bug", "d73a4a", "Something isn't working"],
+              ["needs-info", "fbca04", "Waiting on more detail from the reporter"],
+              ["validated", "0e8a16", "Has the information needed to look into it"],
+              ["outdated-version", "f9d0c4", "Reported on an older release"],
+              ["missed-warning", "b60205", "Did not warn about a run that happened"],
+              ["false-warning", "c2e0c6", "Warned about a run that was not going to happen"],
+            ];
+            for (const [name, color, description] of palette) {
+              try {
+                await github.rest.issues.createLabel({ ...repo, name, color, description });
+              } catch (error) {
+                if (error.status !== 422) throw error; // 422 = already there
+              }
+            }
+
+            const add = (name) =>
+              github.rest.issues.addLabels({ ...repo, issue_number: issue.number, labels: [name] });
+            const drop = async (name) => {
+              try {
+                await github.rest.issues.removeLabel({ ...repo, issue_number: issue.number, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            };
+
+            // Which way it got it wrong. A missed warning loses a real run; an
+            // unnecessary one costs a few seconds. Worth telling apart from the
+            // issue list without opening anything.
+            const missed = /did NOT warn/i.test(direction);
+            const unnecessary = /^It warned, but the automation was not going to run/i.test(direction);
+            await (missed ? add("missed-warning") : drop("missed-warning"));
+            await (unnecessary ? add("false-warning") : drop("false-warning"));
+            await (outdated ? add("outdated-version") : drop("outdated-version"));
+
+            // ---------------------------------------------------------------
+            // One comment, edited in place
+            // ---------------------------------------------------------------
+            let message = marker + "\n";
+            if (missing.length) {
+              await add("needs-info");
+              await drop("validated");
+              message += "Thanks for the report. A few things are needed before this " +
+                         "can be looked into:\n\n";
+              message += missing.map((line) => `- ${line}`).join("\n");
+              message += "\n\n**Edit the issue above** to add them and this will " +
+                         "re-check itself - no need to comment.";
+            } else {
+              await drop("needs-info");
+              await add("validated");
+              message += "Thanks - this has everything needed to look into it.";
+            }
+            if (notes.length) {
+              message += "\n\n---\n\n" + notes.map((line) => `- ${line}`).join("\n");
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...repo, issue_number: issue.number, per_page: 100,
+            });
+            const mine = comments.find((comment) => (comment.body || "").includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ ...repo, comment_id: mine.id, body: message });
+            } else {
+              await github.rest.issues.createComment({
+                ...repo, issue_number: issue.number, body: message,
+              });
+            }
