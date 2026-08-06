@@ -33,15 +33,13 @@
   "use strict";
 
   const SHOW_WHEN_CLEAR = true; // green "safe to restart" note when nothing is due
-  // brief note when a restart-class action is waved through without asking.
-  // "no prompt" otherwise means both "the guard checked and it is fine" and
-  // "the guard never ran", which is impossible to tell apart on a phone.
-  const SHOW_ALLOWED_NOTICE = true;
   const DIALOG_TAG = "dialog-restart";
   const CLASS = "restart-guard-banner";
   const WRAP_CLASS = "restart-guard-wrap";
   const FALLBACK_WINDOW = 6;
   const TICK_MS = 750;
+  // how often to ask the sensor to recalculate while a dialog is on screen
+  const REFRESH_MS = 5000;
   const MAX_LISTED = 6;
 
   const root = () => document.querySelector("home-assistant");
@@ -86,8 +84,6 @@
       error: attrs.error || null,
       // runs in progress right now: a restart cuts them off mid-way
       running: attrs.running || [],
-      blocking: (attrs.running || []).filter((run) => !run.parked),
-      parked: (attrs.running || []).filter((run) => run.parked),
       dueSoon: count > 0 && isFinite(mins) && mins <= win,
       clear: count > 0 && isFinite(mins) && mins > win,
       // Anything part-way through a run is at risk, however long it has been
@@ -142,6 +138,25 @@
       }
       .rg-row.rg-live .rg-tm { opacity: 1; font-weight: 700; }
       .rg-row.rg-live .rg-pill { background: rgba(219, 68, 55, 0.3); }
+      /* a row that leads somewhere. Deliberately subtle: the banner is
+         there to be read, not clicked, and an obviously clickable row would
+         compete with the thing it is warning about. */
+      .rg-row.rg-tap { cursor: pointer; }
+      .rg-row.rg-tap:hover { background: rgba(127, 127, 127, 0.24); }
+      .rg-row.rg-live.rg-tap:hover { background: rgba(219, 68, 55, 0.26); }
+      /* the one-off question, asked the first time a row is tapped */
+      .rg-ask {
+        display: block; margin-top: 8px; padding: 8px 10px;
+        border-radius: 6px; background: rgba(127, 127, 127, 0.18);
+        font-size: 13px;
+      }
+      .rg-ask b { display: block; margin-bottom: 6px; font-weight: 700; }
+      .rg-ask button {
+        font: inherit; font-weight: 700; cursor: pointer;
+        margin-right: 8px; padding: 4px 14px; border-radius: 6px;
+        border: 1px solid currentColor; background: transparent;
+        color: inherit;
+      }
       /* which kind of thing this row is: automation, script or Scheduler */
       .rg-pill {
         display: inline-block;
@@ -247,9 +262,121 @@
    * coloured bar down the left. Names and times are what you actually need to
    * read, so they get their own lines rather than being buried in a sentence.
    */
-  function row(name, detail, pill, extra) {
+  /*
+   * Tapping a row opens whatever it is about.
+   *
+   * The answer lives with the integration, not in this browser. It used to be
+   * `localStorage`, which meant the question came back on every phone, tablet
+   * and laptop in the house, and once answered there was nowhere to go and
+   * change it. Both readings now come off the sensor - `open_on_tap` is the
+   * setting, `tap_answered` is whether anyone has been asked - so answering it
+   * anywhere answers it everywhere, and the options form can flip it back.
+   */
+  function guardAttrs() {
+    const state = guardState();
+    return (state && state.attributes) || {};
+  }
+
+  /*
+   * The answer takes about a second to come back around through the sensor.
+   * Without covering that gap, a second tap inside the same second gets asked
+   * the same question again, which reads as the first answer not having taken.
+   * Time-boxed on purpose: if the call really did fail, this expires and the
+   * prompt comes back, rather than pretending forever that it saved.
+   */
+  let optimistic = null;
+
+  /** "yes" / "no" / null for never asked. */
+  function tapPreference() {
+    const attrs = guardAttrs();
+    if (
+      attrs.tap_answered === false &&
+      optimistic &&
+      Date.now() < optimistic.until
+    ) {
+      return optimistic.answer;
+    }
+    if (attrs.open_on_tap === false) return "no";
+    // absent `tap_answered` means an older sensor that predates it; treat that
+    // as answered rather than interrogating people who already had this working
+    if (attrs.tap_answered === false) return null;
+    return "yes";
+  }
+
+  /** Whether a row should be tappable at all. */
+  function tapsEnabled() {
+    // absent means an older sensor that predates the option, and the feature
+    // is harmless enough to default on rather than vanish silently
+    return guardAttrs().open_on_tap !== false;
+  }
+
+  /** Record the answer for every device at once. */
+  function rememberTap(answer) {
+    optimistic = { answer: answer ? "yes" : "no", until: Date.now() + 10000 };
+    const hass = root() && root().hass;
+    if (!hass || !hass.callService) return;
+    // nothing to do on failure: the prompt simply appears again next time,
+    // which is a better outcome than a preference that silently didn't save
+    hass.callService("restart_guard", "set_open_on_tap", { enabled: !!answer });
+  }
+
+  /** Where a row leads, or null if nothing sensible to open. */
+  function targetFor(entityId) {
+    const hass = root() && root().hass;
+    if (!hass || !entityId) return null;
+    const state = hass.states[entityId];
+    if (!state) return null;
+    const domain = entityId.split(".")[0];
+    const id = state.attributes && state.attributes.id;
+    if (domain === "automation" && id) return `/config/automation/edit/${id}`;
+    if (domain === "script") {
+      return `/config/script/edit/${entityId.split(".")[1]}`;
+    }
+    // A schedule has no page of its own. The Scheduler component is backend
+    // only - what you edit it with is a card, on whichever dashboard its owner
+    // happened to put it - so there is nothing to discover and no id to link
+    // to. If they have told us the dashboard, open that; the card is on it.
+    if (isSchedule(state)) {
+      const path = guardAttrs().scheduler_path;
+      if (path) return String(path);
+    }
+    return null; // anything else opens its more-info dialog instead
+  }
+
+  /**
+   * A Scheduler entity, recognised by what it publishes rather than by its id -
+   * the same two attributes `schedules.is_schedule` checks on the backend, and
+   * deliberately the same two, so a row cannot be a schedule to one half of
+   * this integration and not the other.
+   */
+  function isSchedule(state) {
+    const attrs = (state && state.attributes) || {};
+    return "next_trigger" in attrs && "timeslots" in attrs;
+  }
+
+  function openEntity(entityId) {
+    const app = root();
+    if (!app || !entityId) return;
+    const path = targetFor(entityId);
+    if (path) {
+      history.pushState(null, "", path);
+      window.dispatchEvent(new CustomEvent("location-changed", {
+        detail: { replace: false }, bubbles: true, composed: true,
+      }));
+      return;
+    }
+    // a Scheduler switch, a helper, anything without an editor of its own
+    app.dispatchEvent(new CustomEvent("hass-more-info", {
+      detail: { entityId: entityId }, bubbles: true, composed: true,
+    }));
+  }
+
+  function row(name, detail, pill, extra, entityId) {
+    const tappable = entityId && tapsEnabled();
+    const classes =
+      "rg-row" + (extra ? " " + extra : "") + (tappable ? " rg-tap" : "");
     return (
-      `<span class="rg-row${extra ? " " + extra : ""}">` +
+      `<span class="${classes}"${tappable ? ` data-rg-entity="${esc(entityId)}"` : ""}>` +
       `<span class="rg-nm">${esc(name)}</span>` +
       `<span class="rg-tm">` +
       (pill ? `<span class="rg-pill">${esc(pill)}</span>` : "") +
@@ -278,7 +405,9 @@
     return row(
       trimKind(item.alias),
       `${clockTime(item)} · ${relative(item.minutes)}`,
-      kindOf(item)
+      kindOf(item),
+      null,
+      item.entity_id
     );
   }
 
@@ -307,7 +436,8 @@
         ? `Still running ${detail} — restarting stops it`
         : "Still running — restarting stops it",
       kindOf(run),
-      "rg-live"
+      "rg-live",
+      run.entity_id
     );
   }
 
@@ -424,12 +554,66 @@
     return view ? [view.type, view.title, view.body].join("~") : "hidden";
   }
 
+  /*
+   * One listener per container rather than one per row: the body is replaced
+   * wholesale on every repaint, so anything bound to a row would be thrown
+   * away within the second.
+   */
+  function bindTaps(container) {
+    if (!container || container.__rgTaps) return;
+    container.__rgTaps = true;
+    container.addEventListener("click", (event) => {
+      const path = event.composedPath ? event.composedPath() : [event.target];
+
+      const answer = path.find(
+        (node) => node && node.dataset && node.dataset.rgAsk
+      );
+      if (answer) {
+        event.preventDefault();
+        event.stopPropagation();
+        const yes = answer.dataset.rgAsk === "yes";
+        rememberTap(yes);
+        const pending = container.__rgPending;
+        container.__rgPending = null;
+        const bar = container.querySelector(".rg-ask");
+        if (bar) bar.remove();
+        if (yes && pending) openEntity(pending);
+        return;
+      }
+
+      const rowNode = path.find(
+        (node) => node && node.dataset && node.dataset.rgEntity
+      );
+      if (!rowNode) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const entityId = rowNode.dataset.rgEntity;
+      if (tapPreference() === "yes") {
+        openEntity(entityId);
+        return;
+      }
+      // never asked before: ask once, and act on the answer rather than
+      // making them tap twice for the same thing
+      if (container.querySelector(".rg-ask")) return;
+      container.__rgPending = entityId;
+      const bar = document.createElement("span");
+      bar.className = "rg-ask";
+      bar.innerHTML =
+        "<b>Open it when you tap a row?</b>" +
+        '<button type="button" data-rg-ask="yes">Yes</button>' +
+        '<button type="button" data-rg-ask="no">No</button>';
+      container.appendChild(bar);
+    });
+  }
+
   function apply(parts, view) {
     if (!view) {
       parts.wrap.hidden = true;
       return;
     }
     parts.wrap.hidden = false;
+    bindTaps(parts.alert || parts.body);
 
     if (parts.alert) {
       parts.alert.setAttribute("alert-type", view.type);
@@ -636,10 +820,6 @@
   }
 
   const BANNER_CLASS = "rg-banner";
-  // the banner currently on screen, if any: the notice checks this so the two
-  // never say the same thing one after the other
-  let liveBanner = null;
-
   /*
    * Home Assistant's own restart dialog carries the guard's verdict the moment
    * you open it. A restart-required repair did not - it only spoke up once you
@@ -676,7 +856,6 @@
         let timer = null;
         const stop = () => {
           if (timer) clearInterval(timer);
-          if (liveBanner === card) liveBanner = null;
           card.remove();
         };
         const paint = () => {
@@ -697,7 +876,6 @@
         };
 
         host.prepend(card);
-        liveBanner = card;
         paint();
         host.addEventListener("close", stop);
         // same timing rule as everything else here: ha-alert has not rendered
@@ -788,18 +966,6 @@
       .rg-card .rg-alert { display: block; }
       .rg-card .rg-alert .rg-line { display: block; }
       .rg-card .rg-alert .rg-hint { display: block; margin-top: 8px; opacity: 0.75; }
-      /*
-       * ha-alert paints a translucent tint, so floating over the page it needs
-       * something opaque behind it: keep the notice's own surface and drop only
-       * its padding and border. Inline, the host dialog is already that surface.
-       */
-      .rg-notice.rg-bare {
-        padding: 0; border: none; overflow: hidden;
-      }
-      .rg-notice.rg-bare.rg-inline {
-        background: none; box-shadow: none;
-      }
-      .rg-notice .rg-alert { display: block; }
       .rg-actions {
         display: flex; justify-content: flex-end; gap: 8px;
         margin: 18px -8px 0;
@@ -887,25 +1053,6 @@
       .rg-card.rg-inline .rg-head { font-size: 16px; margin-bottom: 6px; }
       .rg-card.rg-inline .rg-body { font-size: 13px; max-height: 40vh; }
       .rg-card.rg-inline .rg-actions { margin-top: 10px; }
-
-      /* the "checked it, going ahead" note */
-      .rg-notice {
-        position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
-        z-index: 2147483000; max-width: 90vw; box-sizing: border-box;
-        padding: 10px 16px; border-radius: 8px; font-size: 13px; line-height: 1.4;
-        background: var(--card-background-color, #fff);
-        color: var(--primary-text-color, #212121);
-        border: 1px solid rgba(67, 160, 71, 0.5);
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
-        font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
-      }
-      /* inside an open dialog, same trick as the card: flow, do not float */
-      .rg-notice.rg-inline {
-        position: static; transform: none; max-width: none; margin: 0 0 4px;
-        box-shadow: none; background: rgba(67, 160, 71, 0.12);
-        flex: 0 0 auto !important; align-self: stretch !important;
-        order: -1 !important;
-      }
     `;
 
   function modalStyle() {
@@ -1214,67 +1361,6 @@
     });
   }
 
-  /**
-   * Say, briefly, that the guard looked and decided not to stand in the way.
-   * Goes inside an open dialog when there is one, for the same top-layer
-   * reason the confirm box does.
-   */
-  let lastNotice = { text: "", at: 0 };
-
-  function notice(text) {
-    if (!SHOW_ALLOWED_NOTICE) return;
-    // a banner is already showing this verdict, in the dialog being looked at:
-    // a second green box underneath it says nothing new
-    if (liveBanner && liveBanner.isConnected) return;
-    // belt and braces: whatever else goes wrong, never say the same thing twice
-    const at = Date.now();
-    if (text === lastNotice.text && at - lastNotice.at < 3000) return;
-    lastNotice = { text: text, at: at };
-    try {
-      modalStyle();
-      const host = openModalHost();
-      const el = document.createElement("div");
-      el.className = "rg-notice" + (host ? " rg-inline" : "");
-      if (host) {
-        const scoped = document.createElement("style");
-        scoped.textContent = MODAL_CSS;
-        el.appendChild(scoped);
-      }
-      // the same green box the dialog shows when it is safe to restart
-      if (customElements.get("ha-alert")) {
-        const alert = document.createElement("ha-alert");
-        alert.className = "rg-alert";
-        alert.setAttribute("alert-type", "success");
-        alert.textContent = text;
-        el.classList.add("rg-bare"); // ha-alert brings its own box
-        el.appendChild(alert);
-      } else {
-        const label = document.createElement("span");
-        label.textContent = text;
-        el.appendChild(label);
-      }
-      (host || document.body).prepend(el);
-      // A host dialog can leave it with no room, exactly as it can the card,
-      // and a note nobody can see is the same as no note at all. Measure a
-      // couple of frames later, though: ha-alert has not rendered on this tick,
-      // so an immediate read is zero and would evict a perfectly good note.
-      if (host) {
-        const settle = () => {
-          if (!el.isConnected) return;
-          const rect = el.getBoundingClientRect();
-          if (rect.height < 8 || rect.width < 20 || rect.bottom <= 0) {
-            el.classList.remove("rg-inline");
-            document.body.prepend(el);
-          }
-        };
-        requestAnimationFrame(() => requestAnimationFrame(settle));
-      }
-      setTimeout(() => el.remove(), 4000);
-    } catch (err) {
-      /* a note is never worth breaking a restart over */
-    }
-  }
-
   function sleep(ms) {
     return new Promise((done) => setTimeout(done, ms));
   }
@@ -1283,7 +1369,6 @@
   async function shouldProceed(action) {
     let info = guardInfo();
     if (!info || info.missing) {
-      notice("Restart Guard: no sensor to check — going ahead");
       allowOnce(action, HANDOFF_MS); // decided: the layer below must not re-ask
       return true; // no sensor: never in the way
     }
@@ -1302,16 +1387,10 @@
 
     info = guardInfo();
     if (!info || info.missing) {
-      notice("Restart Guard: no sensor to check — going ahead");
       allowOnce(action, HANDOFF_MS);
       return true;
     }
     if (!info.warn) {
-      notice(
-        info.count
-          ? `Restart Guard: nothing at risk — next run ${relative(info.mins)}`
-          : `Restart Guard: nothing scheduled ${horizon(info.lookahead)} — going ahead`
-      );
       // One action is one decision. Without this the same restart is judged
       // again on its way down to the websocket, and says so a second time.
       allowOnce(action, HANDOFF_MS);
@@ -1490,6 +1569,8 @@
       return true;
     };
 
+    let refreshedAt = 0;
+
     const tick = () => {
       if (!host.isConnected) return;
       const open = isOpen(host);
@@ -1498,11 +1579,22 @@
         // freshly opened: forget any previous arming, ask for a fresh value
         armed = false;
         lastSig = null;
-        const info = guardInfo();
-        if (info && !info.missing) forceRefresh(info.entityId);
+        refreshedAt = 0;
       }
       wasOpen = open;
       if (!open) return;
+
+      // The sensor recomputes on its own half-minute poll, so a dialog left
+      // sitting open would show a value up to that old - which is why closing
+      // and reopening used to be the only way to see a change. Asking for a
+      // recalculation while it is on screen keeps it honest; the cost is one
+      // entity update, and only for as long as somebody is looking.
+      const now = Date.now();
+      if (now - refreshedAt > REFRESH_MS) {
+        refreshedAt = now;
+        const info = guardInfo();
+        if (info && !info.missing) forceRefresh(info.entityId);
+      }
       if (!build()) return;
 
       const view = describeState(guardInfo(), armed);

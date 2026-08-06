@@ -21,7 +21,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import condition as condition_helper
 from homeassistant.util import dt as dt_util
 
-from .calc import as_list, is_enabled
+from .calc import as_list, date_certain_verdict, is_enabled
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -290,9 +290,14 @@ class ConditionEvaluator:
         return {"trigger": {"id": trigger_id, "platform": "time"}}
 
     async def async_verdict(
-        self, entity: Any, item: dict[str, Any], same_day: bool
+        self, entity: Any, item: dict[str, Any], near: bool
     ) -> Verdict:
-        """Would this projected run actually do something?"""
+        """Would this projected run actually do something?
+
+        `near` is whether the run is close enough that reading the house right
+        now is a fair guess at how it will be then. Far-off runs are assumed to
+        happen rather than judged on stale readings.
+        """
         raw = getattr(entity, "raw_config", None)
         raw = raw if isinstance(raw, dict) else {}
 
@@ -301,9 +306,22 @@ class ConditionEvaluator:
         if verdict is not None:
             return verdict
 
+        # ---- 1b. what the calendar alone settles --------------------------
+        # Weekday and trigger-id conditions need nothing from the house, so
+        # they hold for a run tomorrow as firmly as one today. Checked before
+        # the bail below, because that is exactly the case they answer: an
+        # automation gated on Sunday, firing at 00:01 on Monday.
+        moment = dt_util.parse_datetime(str(item.get("at") or ""))
+        if moment is not None:
+            settled = date_certain_verdict(
+                raw, set(self._item_trigger_ids(item)), dt_util.as_local(moment)
+            )
+            if settled is False:
+                return Verdict(False, "the day it falls on rules it out")
+
         # Anything below evaluates live state, which is only a fair proxy for
-        # what will be true at the trigger time if that is still today.
-        if not same_day:
+        # what will be true at the trigger time if the trigger time is close.
+        if not near:
             return WILL_RUN
 
         # ---- 2. the automation's own conditions block -----------------------

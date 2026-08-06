@@ -9,17 +9,17 @@
           "warn_window": "若自动化即将在此时段内运行则警告",
           "lookahead": "最大向前检测范围",
           "min_interval": "忽略重复频率高于此值的自动化",
-          "stale_run": "运行超过此时间后不再阻止重启",
           "check_conditions": "条件不满足时保持安静",
-          "track_schedules": "同时监控 Scheduler 日程"
+          "track_schedules": "同时监控 Scheduler 日程",
+          "open_on_tap": "点击条目即可打开"
         },
         "data_description": {
           "warn_window": "距离重启多近才算太近。",
           "lookahead": "超出此范围的自动化不会被追踪。",
           "min_interval": "阻止每5分钟触发一次的自动化持续发出警告。",
-          "stale_run": "正在运行的自动化总会警告您，因为重启会中断它。但如果运行时间超过此值，则可能卡在 wait_for_trigger 中，因此会列出但不要求第二次确认。",
           "check_conditions": "如果某个自动化触发后不会执行任何操作（因为条件不满足或没有匹配的 choose 分支），则不发出警告。关闭此选项将对所有计划运行都发出警告。",
-          "track_schedules": "包含来自 Scheduler 组件 (nielsfaber) 的日程。仅计算已启用的日程——禁用的日程仍会发布永远不会执行的触发时间。"
+          "track_schedules": "包含来自 Scheduler 组件 (nielsfaber) 的日程。仅计算已启用的日程——禁用的日程仍会发布永远不会执行的触发时间。",
+          "open_on_tap": "在警告中点击自动化、脚本或日程即可将其打开。首次点击时会询问您是否需要此功能；在此关闭将完全停用。"
         }
       }
     },
@@ -35,17 +35,17 @@
           "warn_window": "若自动化即将在此时段内运行则警告",
           "lookahead": "最大向前检测范围",
           "min_interval": "忽略重复频率高于此值的自动化",
-          "stale_run": "运行超过此时间后不再阻止重启",
           "check_conditions": "条件不满足时保持安静",
-          "track_schedules": "同时监控 Scheduler 日程"
+          "track_schedules": "同时监控 Scheduler 日程",
+          "open_on_tap": "点击条目即可打开"
         },
         "data_description": {
           "warn_window": "距离重启多近才算太近。",
           "lookahead": "超出此范围的自动化不会被追踪。",
           "min_interval": "阻止每5分钟触发一次的自动化持续发出警告。",
-          "stale_run": "正在运行的自动化总会警告您，因为重启会中断它。但如果运行时间超过此值，则可能卡在 wait_for_trigger 中，因此会列出但不要求第二次确认。",
           "check_conditions": "如果某个自动化触发后不会执行任何操作（因为条件不满足或没有匹配的 choose 分支），则不发出警告。关闭此选项将对所有计划运行都发出警告。",
-          "track_schedules": "包含来自 Scheduler 组件 (nielsfaber) 的日程。仅计算已启用的日程——禁用的日程仍会发布永远不会执行的触发时间。"
+          "track_schedules": "包含来自 Scheduler 组件 (nielsfaber) 的日程。仅计算已启用的日程——禁用的日程仍会发布永远不会执行的触发时间。",
+          "open_on_tap": "在警告中点击自动化、脚本或日程即可将其打开。首次点击时会询问您是否需要此功能；在此关闭将完全停用。"
         }
       }
     }

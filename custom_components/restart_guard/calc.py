@@ -188,6 +188,73 @@ def weekdays_from_conditions(config: Any) -> set[str] | None:
     return result
 
 
+def date_certain(
+    config: Any, trigger_ids: set[str], moment: dt.datetime
+) -> bool | None:
+    """Evaluate the conditions that depend only on *which day* the run is on.
+
+    `condition: trigger` and a `condition: time` carrying nothing but
+    `weekday:` are settled by the calendar, not by anything in the house. They
+    can therefore be judged for a run tomorrow as confidently as one today,
+    which is the whole point: an automation gated on "Sunday" and firing at
+    00:01 on Monday is not a maybe.
+
+    Three-valued on purpose. None means "not decidable from the date", and it
+    has to propagate honestly - `False and unknown` is False, but
+    `False or unknown` is still unknown, and treating it as False would
+    silence a run nobody has ruled out.
+    """
+    if not isinstance(config, dict):
+        return None
+
+    kind = config.get("condition")
+    if kind in ("and", "or", "not"):
+        parts = [
+            date_certain(node, trigger_ids, moment)
+            for node in as_list(config.get("conditions"))
+        ]
+        if not parts:
+            return None
+        if kind == "not":
+            inner = parts[0]
+            return None if inner is None else not inner
+        if kind == "and":
+            if any(part is False for part in parts):
+                return False
+            return True if all(part is True for part in parts) else None
+        if any(part is True for part in parts):
+            return True
+        return False if all(part is False for part in parts) else None
+
+    if kind == "trigger":
+        wanted = {str(value) for value in as_list(config.get("id"))}
+        return bool(wanted & trigger_ids) if wanted else None
+
+    if kind == "time":
+        # only when the weekday is all it says: `after:`/`before:` would need
+        # the clock, and that is not what this is for
+        if config.get("after") is not None or config.get("before") is not None:
+            return None
+        days = weekdays_from(config)
+        return None if days is None else WEEKDAYS[moment.weekday()] in days
+
+    return None
+
+
+def date_certain_verdict(
+    config: Any, trigger_ids: set[str], moment: dt.datetime
+) -> bool | None:
+    """The automation's whole `conditions:` block, judged on the date alone."""
+    if not isinstance(config, dict):
+        return None
+    nodes = as_list(config.get("conditions") or config.get("condition"))
+    if not nodes:
+        return None
+    return date_certain(
+        {"condition": "and", "conditions": nodes}, trigger_ids, moment
+    )
+
+
 def time_window_from_conditions(config: Any) -> tuple[dt.time, dt.time] | None:
     """The (after, before) window a `condition: time` pins the run to.
 

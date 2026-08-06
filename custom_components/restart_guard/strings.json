@@ -9,17 +9,19 @@
           "warn_window": "Warn if an automation is due within",
           "lookahead": "Look ahead at most",
           "min_interval": "Ignore automations repeating more often than",
-          "stale_run": "Stop blocking on a run still going after",
           "check_conditions": "Stay quiet when conditions can't pass",
-          "track_schedules": "Also watch Scheduler schedules"
+          "track_schedules": "Also watch Scheduler schedules",
+          "open_on_tap": "Open on tap",
+          "scheduler_path": "Dashboard your scheduler card is on"
         },
         "data_description": {
           "warn_window": "How close counts as too close to restart.",
           "lookahead": "Automations further out than this are not tracked.",
           "min_interval": "Stops every-5-minutes automations from warning constantly.",
-          "stale_run": "An automation part-way through a run always warns you, because restarting cuts it off. But one still going after this long is probably parked in a wait_for_trigger, so it is listed without requiring the second tap.",
           "check_conditions": "Don't warn about an automation that would fire and do nothing, because its conditions don't pass or no choose branch matches. Turn this off to warn about every scheduled run regardless.",
-          "track_schedules": "Include schedules from the Scheduler component (nielsfaber). Only enabled schedules count - a disabled one keeps publishing a next trigger time it will never act on."
+          "track_schedules": "Include schedules from the Scheduler component (nielsfaber). Only enabled schedules count - a disabled one keeps publishing a next trigger time it will never act on.",
+          "open_on_tap": "Tap an automation, script or schedule in the warning to go straight to it.",
+          "scheduler_path": "Only for schedules. Enter the dashboard your scheduler card is on, for example /lovelace/scheduler. Leave empty and the row opens the entity dialog instead."
         }
       }
     },
@@ -35,17 +37,31 @@
           "warn_window": "Warn if an automation is due within",
           "lookahead": "Look ahead at most",
           "min_interval": "Ignore automations repeating more often than",
-          "stale_run": "Stop blocking on a run still going after",
           "check_conditions": "Stay quiet when conditions can't pass",
-          "track_schedules": "Also watch Scheduler schedules"
+          "track_schedules": "Also watch Scheduler schedules",
+          "open_on_tap": "Open on tap",
+          "scheduler_path": "Dashboard your scheduler card is on"
         },
         "data_description": {
           "warn_window": "How close counts as too close to restart.",
           "lookahead": "Automations further out than this are not tracked.",
           "min_interval": "Stops every-5-minutes automations from warning constantly.",
-          "stale_run": "An automation part-way through a run always warns you, because restarting cuts it off. But one still going after this long is probably parked in a wait_for_trigger, so it is listed without requiring the second tap.",
           "check_conditions": "Don't warn about an automation that would fire and do nothing, because its conditions don't pass or no choose branch matches. Turn this off to warn about every scheduled run regardless.",
-          "track_schedules": "Include schedules from the Scheduler component (nielsfaber). Only enabled schedules count - a disabled one keeps publishing a next trigger time it will never act on."
+          "track_schedules": "Include schedules from the Scheduler component (nielsfaber). Only enabled schedules count - a disabled one keeps publishing a next trigger time it will never act on.",
+          "open_on_tap": "Tap an automation, script or schedule in the warning to go straight to it.",
+          "scheduler_path": "Only for schedules. Enter the dashboard your scheduler card is on, for example /lovelace/scheduler. Leave empty and the row opens the entity dialog instead."
+        }
+      }
+    }
+  },
+  "services": {
+    "set_open_on_tap": {
+      "name": "Set open on tap",
+      "description": "Records whether tapping a row in the restart warning should open what it is about. The warning calls this itself when you answer its prompt; the same setting is in the integration's options.",
+      "fields": {
+        "enabled": {
+          "name": "Enabled",
+          "description": "Whether a tap opens the automation, script or schedule."
         }
       }
     }

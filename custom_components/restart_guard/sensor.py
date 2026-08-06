@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_component import DATA_INSTANCES
@@ -40,19 +41,25 @@ from .const import (
     CONF_CHECK_CONDITIONS,
     CONF_LOOKAHEAD,
     CONF_MIN_INTERVAL,
-    CONF_STALE_RUN,
+    CONF_OPEN_ON_TAP,
+    CONF_SCHEDULER_PATH,
+    CONF_TAP_ANSWERED,
     CONF_TRACK_SCHEDULES,
     CONF_WARN_WINDOW,
+    CONDITION_HORIZON,
     DEFAULT_CHECK_CONDITIONS,
     DEFAULT_LOOKAHEAD,
     DEFAULT_MIN_INTERVAL,
-    DEFAULT_STALE_RUN,
+    DEFAULT_OPEN_ON_TAP,
+    DEFAULT_TAP_ANSWERED,
     DEFAULT_TRACK_SCHEDULES,
     DEFAULT_WARN_WINDOW,
     DOMAIN,
     NOTHING_DUE,
     RUN_DOMAINS,
     SCHEDULER_DOMAIN,
+    SIGNAL_OPTIONS,
+    STARTED_AT,
     VERSION,
 )
 
@@ -270,6 +277,20 @@ class RestartGuardSensor(SensorEntity):
         self._mirrors: dict[tuple[str, str], Any] | None = None
         self._declares: dict[str, bool] = {}
 
+    async def async_added_to_hass(self) -> None:
+        """Republish when a display option changes.
+
+        Those changes deliberately don't reload the entry, so nothing else
+        would tell the banner about them until the next poll - and a prompt
+        that stays on screen for another half-minute after being answered
+        reads as not having worked.
+        """
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_OPTIONS, self.async_write_ha_state
+            )
+        )
+
     # -- options ----------------------------------------------------------
     @property
     def _options(self) -> dict[str, Any]:
@@ -306,6 +327,21 @@ class RestartGuardSensor(SensorEntity):
             "blocking_runs": len(self._running),
             "warn_window": self._option(CONF_WARN_WINDOW, DEFAULT_WARN_WINDOW),
             "lookahead": self._option(CONF_LOOKAHEAD, DEFAULT_LOOKAHEAD),
+            # read by the frontend module: may a row be tapped to open
+            # whatever it is about
+            "open_on_tap": self._option_bool(
+                CONF_OPEN_ON_TAP, DEFAULT_OPEN_ON_TAP
+            ),
+            # whether anyone has answered the banner's prompt yet. Kept here
+            # rather than in each browser's storage, so answering it on a phone
+            # also answers it on the laptop.
+            "tap_answered": self._option_bool(
+                CONF_TAP_ANSWERED, DEFAULT_TAP_ANSWERED
+            ),
+            # where a schedule row leads. A schedule has no page of its own, so
+            # this is whichever dashboard the user keeps their scheduler card
+            # on; empty means the row opens the entity dialog instead.
+            "scheduler_path": self._scheduler_path(),
             "automations_scanned": self._scanned,
             # what kinds of trigger were actually seen, so "it isn't warning me"
             # can be told apart from "it never saw that trigger at all"
@@ -462,6 +498,19 @@ class RestartGuardSensor(SensorEntity):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    def _scheduler_path(self) -> str:
+        """The dashboard a schedule row should open, or "" for none.
+
+        Normalised to a leading slash so `/lovelace/scheduler`, `lovelace/
+        scheduler` and a stray trailing space all mean the same thing - the
+        value is typed by hand into a text box, and a path that silently does
+        nothing is a bad way to find out it was mistyped.
+        """
+        raw = str(self._options.get(CONF_SCHEDULER_PATH, "") or "").strip()
+        if not raw:
+            return ""
+        return raw if raw.startswith("/") else f"/{raw}"
+
     async def _async_drop_no_ops(
         self, items: list[dict[str, Any]], now: dt.datetime
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -485,10 +534,13 @@ class RestartGuardSensor(SensorEntity):
             if entity is None:
                 keep.append(item)
                 continue
-            same_day = dt_util.parse_datetime(item["at"]) is not None and (
-                dt_util.parse_datetime(item["at"]).date() == now.date()
+            # Near enough that reading the house now is a fair guess at how it
+            # will be then - measured as a duration, not as "is it still today".
+            moment = dt_util.parse_datetime(item["at"])
+            near = moment is not None and (
+                moment - now <= dt.timedelta(minutes=CONDITION_HORIZON)
             )
-            verdict = await self._conditions.async_verdict(entity, item, same_day)
+            verdict = await self._conditions.async_verdict(entity, item, near)
             if verdict.will_run:
                 keep.append(item)
             else:
@@ -504,7 +556,6 @@ class RestartGuardSensor(SensorEntity):
         and the `current` attribute covers every one of them without us having
         to understand the action script at all.
         """
-        parked_after = self._option(CONF_STALE_RUN, DEFAULT_STALE_RUN) * 60
         found: list[dict[str, Any]] = []
 
         for domain in RUN_DOMAINS:
@@ -529,19 +580,17 @@ class RestartGuardSensor(SensorEntity):
                         "alias": state.attributes.get("friendly_name") or state.entity_id,
                         "current": current,
                         "seconds_ago": seconds,
-                        # a run idling for ages is almost certainly parked in a
-                        # wait_for_trigger: worth showing, not worth blocking on
-                        "parked": bool(
-                            parked_after and seconds is not None and seconds > parked_after
-                        ),
                     }
                 )
 
+        # Newest first. There used to be a "parked" flag here too - a run going
+        # for over an hour was assumed to be idling in a wait_for_trigger and
+        # sorted last, on its way to being treated as less urgent. That was
+        # wrong: a three-hour delay is precisely what a restart destroys, and
+        # taking a while is not evidence of doing nothing. Every run in
+        # progress blocks now, so there is nothing left to rank them by.
         found.sort(
-            key=lambda run: (
-                run["parked"],
-                run["seconds_ago"] if run["seconds_ago"] is not None else 10**9,
-            )
+            key=lambda run: run["seconds_ago"] if run["seconds_ago"] is not None else 10**9
         )
         return found
 
@@ -888,11 +937,22 @@ class RestartGuardSensor(SensorEntity):
         if matches and state.last_changed is not None:
             since = dt_util.as_local(state.last_changed)
             done = since + held
-            if done > now:
+            # A state restored at startup was never *observed* changing, and
+            # Home Assistant only arms a `for:` countdown on an observed
+            # change. So a `last_changed` at or before the moment Home
+            # Assistant finished starting means no countdown is running,
+            # however recent it looks - it is just when everything came back.
+            # Believing it produced a phantom run after every restart, for the
+            # whole length of the delay.
+            started = self.hass.data.get(STARTED_AT)
+            restored = started is not None and since <= started
+            if done > now and not restored:
                 self._count_prediction("pending for")
                 # `last_changed` carries microseconds; every other prediction
                 # here is a whole second, and the banner shows minutes
                 return done.replace(microsecond=0)
+            if restored:
+                self._count_prediction("for: not armed")
 
         change = self._state_change_next(entity_id, to_state, from_state)
         return None if change is None else change + held

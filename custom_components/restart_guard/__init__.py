@@ -6,17 +6,33 @@ import hashlib
 import logging
 from pathlib import Path
 
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, FRONTEND_FILE, FRONTEND_URL, VERSION
+from .const import (
+    CONF_OPEN_ON_TAP,
+    CONF_TAP_ANSWERED,
+    DISPLAY_OPTIONS,
+    DOMAIN,
+    FRONTEND_FILE,
+    FRONTEND_URL,
+    SERVICE_SET_OPEN_ON_TAP,
+    SIGNAL_OPTIONS,
+    STARTED_AT,
+    VERSION,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 _STATIC_FLAG = f"{DOMAIN}_static_path_registered"
 _URL_KEY = f"{DOMAIN}_module_url"
+_STARTED_AT = STARTED_AT
 
 
 def _module_url(hass: HomeAssistant) -> str:
@@ -41,14 +57,74 @@ def _module_url(hass: HomeAssistant) -> str:
     return url
 
 
+def _mark_started(hass: HomeAssistant) -> None:
+    """Record when Home Assistant finished starting, once per run.
+
+    A `state ... for:` trigger only arms when Home Assistant *observes* the
+    change. A state restored at startup was never observed, so no countdown is
+    running for it - and predicting one produces a phantom run for the whole
+    `for:` duration after every restart.
+
+    Two things this must not be. Not the moment this integration set up:
+    changing an option reloads the entry while Home Assistant keeps running,
+    and moving the mark forward would suppress a countdown that really is
+    armed - a missed warning, which is worse than the phantom. And not the
+    moment setup *began* at a cold start either, because entities are still
+    being restored then; waiting for the started event puts the mark after the
+    last of them.
+    """
+    if _STARTED_AT in hass.data:
+        return  # a reload: the original mark is the one that means anything
+    hass.data[_STARTED_AT] = dt_util.now()
+    if hass.state is not CoreState.running:
+        hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED,
+            lambda _event: hass.data.__setitem__(_STARTED_AT, dt_util.now()),
+        )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Restart Guard from a config entry."""
+    _mark_started(hass)
     await _async_register_static_path(hass)
     url = await hass.async_add_executor_job(_module_url, hass)
     _add_module_url(hass, url)
+    _register_services(hass, entry)
+    # the snapshot the next option change is diffed against
+    hass.data[f"{DOMAIN}_options_{entry.entry_id}"] = dict(entry.options)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
+
+
+@callback
+def _register_services(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Let the banner record the answer to its own prompt.
+
+    The prompt used to write to `localStorage`, which meant answering it once
+    per browser, per phone, per person - and no way to change your mind except
+    to find the same prompt again. Writing it to the config entry instead makes
+    one answer the answer everywhere, and puts it beside the toggle in the
+    options form where it can be flipped back.
+    """
+
+    async def _set(call: ServiceCall) -> None:
+        enabled = bool(call.data["enabled"])
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_OPEN_ON_TAP: enabled,
+                CONF_TAP_ANSWERED: True,
+            },
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_OPEN_ON_TAP,
+        _set,
+        schema=vol.Schema({vol.Required("enabled"): cv.boolean}),
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -62,7 +138,31 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload when the user changes options."""
+    """Reload when the user changes options - unless nothing needs reloading.
+
+    Most options change what gets computed, so the entry has to come back up
+    with them. The display ones do not, and reloading for those would be
+    actively harmful: it takes the sensor away for a moment, and the moment is
+    while somebody is standing in the restart dialog reading it. Worse, the
+    prompt that sets one of them lives *in* that dialog, so answering it would
+    blank the very thing being answered.
+    """
+    key = f"{DOMAIN}_options_{entry.entry_id}"
+    before = hass.data.get(key) or {}
+    after = dict(entry.options)
+    hass.data[key] = after
+
+    changed = {
+        name
+        for name in set(before) | set(after)
+        if before.get(name) != after.get(name)
+    }
+    # an empty set is a subset too, which is the answer we want: the entry was
+    # updated without any option actually changing, so there is nothing to do
+    if changed.issubset(DISPLAY_OPTIONS):
+        async_dispatcher_send(hass, SIGNAL_OPTIONS)
+        return
+
     await hass.config_entries.async_reload(entry.entry_id)
 
 

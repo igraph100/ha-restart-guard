@@ -155,12 +155,28 @@ out when that change falls before the trigger. The condition is set aside and th
 warns instead. For an ordinary helper or switch, whose changes nobody can foresee, this
 costs nothing and the old caveat still applies.
 
+For those unforeseeable ones there's a blunter rule: conditions are only evaluated for
+runs **within the next six hours**. Past that, the run is assumed to happen. Reading a
+switch now says a good deal about a run at teatime and very little about one tomorrow
+evening.
+
+Six hours is a duration, deliberately, and not "is it still today". A date boundary
+measures the wrong thing in both directions — 23:15 to 00:00 is forty-five minutes and
+two different days, so an hourly automation with a failing condition used to warn every
+night in that hour; 00:05 to 23:55 is twenty-three hours and one day, and used to be
+ruled out on a reading most of a day stale. With the default 60-minute lookahead nothing
+can fall outside six hours anyway, so this only shows up if you've raised it.
+
+Conditions that need nothing from the house are exempt, because they're just as true
+tomorrow: `weekday`, and `condition: trigger`. An automation gated on Sunday, firing at
+00:01 on Monday, is ruled out on the day it lands on however far away it is.
+
 **When in doubt, it warns.** A wrong "safe to restart" costs you a real automation run,
 so anything that can't be judged confidently counts as *will run*:
 
 | Situation | Why it still warns |
 |---|---|
-| Trigger fires on a different calendar day | Live state now is a poor proxy for then |
+| The run is more than six hours away | Live state now is a poor proxy for then |
 | A branch uses `condition: time` with `after:` / `before:` | Evaluating minutes early gives the wrong answer |
 | `choose` has a non-empty `default:` | Something always happens |
 | A step that always acts — a bare service call, a `delay`, a `repeat` | It runs whatever the trigger was |
@@ -217,9 +233,22 @@ follows the **Stay quiet when conditions can't pass** option.
 | Warn if an automation is due within | 6 min | How close counts as too close to restart |
 | Look ahead at most | 60 min | Automations further out than this aren't tracked. Up to 1440, since calendar-driven runs turn over 12-20 hours out |
 | Ignore automations repeating more often than | 60 min | Stops an every-5-minutes `time_pattern` from warning constantly |
-| Call a run long-running after | 60 min | Only affects wording. Any run in progress warns and needs the second tap, however long it has been going — a three-hour `delay` is exactly what a restart destroys |
 | Stay quiet when conditions can't pass | on | Skip automations that would fire and do nothing |
 | Also watch Scheduler schedules | on | Include scheduler-component schedules |
+| Open on tap | on | Tap an automation, script or schedule in the warning to go straight to it |
+| Dashboard your scheduler card is on | empty | Only affects schedules. Format `/dashboard/view`, e.g. `/lovelace/scheduler`. Only appears when the switch above is on |
+
+**Tapping a row.** An automation opens its editor, a script opens its own. The first tap
+asks whether you want this; the answer is stored with the integration rather than in the
+browser, so answering it on your phone answers it on the laptop too, and the toggle above
+changes your mind later. One consequence worth knowing in a shared house: whoever
+answers "no" turns it off for everybody.
+
+A schedule has no page of its own — the Scheduler component is backend-only, and what you
+edit a schedule with is a card on whichever dashboard its owner put it on. There's nothing
+to discover and no id to link to, so if you want schedule rows to go somewhere, name the
+dashboard yourself: `/lovelace/scheduler`, or wherever your card lives. Left empty, those
+rows open the entity dialog instead.
 
 ---
 
@@ -235,10 +264,11 @@ against `9999`.
 | `count` | How many are inside the window (`0` = nothing due) |
 | `skipped` | Runs that would fire but do nothing, each with a `reason` |
 | `skipped_count` | How many were skipped |
-| `running` | Runs in progress: `alias`, `entity_id`, `current`, `seconds_ago`, `parked` |
+| `running` | Runs in progress: `alias`, `entity_id`, `current`, `seconds_ago` |
 | `running_count` | How many are mid-run |
-| `blocking_runs` | How many are mid-run, all of which arm the second tap |
+| `blocking_runs` | Same number as `running_count`. Every run in progress blocks, however long it has been going — kept as its own name because that is the question being asked |
 | `warn_window`, `lookahead` | Current options, read by the frontend module |
+| `open_on_tap`, `tap_answered`, `scheduler_path` | The tap settings, read by the frontend module. `tap_answered` is whether anyone has been asked yet |
 | `automations_scanned` | How many automation entities were examined |
 | `trigger_kinds` | Count of each trigger kind recognised, e.g. `{"sun": 2, "time": 16}`. Tells "understood, not due" apart from "never recognised" |
 | `state_predictions` | How each predicted state change was worked out — the entity's own window, its integration's published moments, a boolean attribute, a running `for:` countdown, or a timer |
@@ -279,7 +309,7 @@ card:
 | `time_pattern` | Unless it repeats more often than the min interval |
 | `sun` with `offset` | `sun.sun`'s own `next_rising` / `next_setting`, the same times the trigger is scheduled from |
 | `calendar` event start / end, with an offset | The calendar entity's own `start_time` / `end_time` |
-| `state` with `for:` | The countdown already running (`last_changed` + the delay), or the predicted change plus it |
+| `state` with `for:` | The countdown already running (`last_changed` + the delay), or the predicted change plus it — but only a countdown Home Assistant actually saw start, see below |
 | `timer.*` finishing | The timer's own `finishes_at`, while it is running |
 | `state` on an `attribute:` | The same published windows, read for that attribute rather than the state |
 | `state` on an entity that publishes when it next changes | The entity's own window attributes, or times published by its integration — see [Predictable state changes](#predictable-state-changes) |
@@ -287,6 +317,15 @@ card:
 | `conditions:` blocks and `choose` branch conditions | Evaluated, see [When it stays quiet](#when-it-stays-quiet) |
 | Scheduler component schedules | The `next_trigger` attribute, enabled schedules only |
 | Scheduler per-timeslot conditions | Scheduler's own `is`/`not`/`above`/`below` language |
+
+**A `for:` countdown only counts if Home Assistant watched it start.** A state trigger
+listens for state-change *events*, and it starts listening when the automation is set up.
+A state restored at startup produces no such event, so no countdown is armed and the run
+never comes — however recent `last_changed` looks, because what it records is when
+everything came back. Taking it at face value invented a run after every single restart,
+for the whole length of the delay. So a `last_changed` at or before the moment Home
+Assistant finished starting is ignored, and the real next occurrence is used instead.
+Those show up as `for: not armed` in `state_predictions`.
 
 A `condition: time` block narrows things down in two ways. `weekday:` limits the days, so
 a "Sundays only" automation won't warn you on a Thursday. `after:`/`before:` limits the

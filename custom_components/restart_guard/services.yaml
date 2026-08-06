@@ -1,0 +1,7 @@
+set_open_on_tap:
+  fields:
+    enabled:
+      required: true
+      example: true
+      selector:
+        boolean:
