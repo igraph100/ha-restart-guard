@@ -134,6 +134,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     module is dropped from the frontend so the banner stops appearing.
     """
     _remove_module_url(hass, _module_url(hass))
+    # Forget the cached URL, so setting up again re-reads the file and hashes
+    # whatever is there now.
+    #
+    # Without this the digest was computed once per Home Assistant process and
+    # kept for its lifetime. Drop a new restart_guard.js in place and reload the
+    # integration, and the frontend was still handed the old URL - which the
+    # browser already had cached, so it kept running the old file no matter how
+    # hard anyone refreshed. The one thing the hash exists to prevent, arrived
+    # at from the other side.
+    hass.data.pop(_URL_KEY, None)
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

@@ -357,6 +357,18 @@
   function openEntity(entityId) {
     const app = root();
     if (!app || !entityId) return;
+
+    /*
+     * Whatever dialog the row was drawn in has to go first.
+     *
+     * The restart dialog closes itself when the page navigates, which is why
+     * this was not needed while the rows only lived there. A more-info dialog
+     * does not: it stays put, floating on top of the automation you just asked
+     * to be shown, which looks like the tap did nothing.
+     */
+    const host = openModalHost();
+    if (host) dismissHost(host);
+
     const path = targetFor(entityId);
     if (path) {
       history.pushState(null, "", path);
@@ -365,10 +377,15 @@
       }));
       return;
     }
-    // a Scheduler switch, a helper, anything without an editor of its own
-    app.dispatchEvent(new CustomEvent("hass-more-info", {
-      detail: { entityId: entityId }, bubbles: true, composed: true,
-    }));
+    // A Scheduler switch, a helper, anything without an editor of its own.
+    // One dialog replacing another, so let the first finish closing - opening
+    // the new one in the same tick can land under the one being dismissed.
+    const show = () =>
+      app.dispatchEvent(new CustomEvent("hass-more-info", {
+        detail: { entityId: entityId }, bubbles: true, composed: true,
+      }));
+    if (host) setTimeout(show, 150);
+    else show();
   }
 
   function row(name, detail, pill, extra, entityId) {
@@ -562,6 +579,20 @@
   function bindTaps(container) {
     if (!container || container.__rgTaps) return;
     container.__rgTaps = true;
+    /*
+     * Leaving, from wherever this row was drawn.
+     *
+     * The confirm prompt is the one that matters here. It is a question the
+     * restart is waiting on the answer to, so wandering off to look at an
+     * automation without settling it would leave the call hanging forever.
+     * Tapping a row is not a confirmation, so the prompt sets this to its own
+     * cancel and the restart is refused - which is the safe direction, and the
+     * obvious reading of "I want to go and look at that first".
+     */
+    const leaving = () => {
+      const hook = container.__rgOnLeave;
+      if (typeof hook === "function") hook();
+    };
     container.addEventListener("click", (event) => {
       const path = event.composedPath ? event.composedPath() : [event.target];
 
@@ -577,7 +608,10 @@
         container.__rgPending = null;
         const bar = container.querySelector(".rg-ask");
         if (bar) bar.remove();
-        if (yes && pending) openEntity(pending);
+        if (yes && pending) {
+          leaving();
+          openEntity(pending);
+        }
         return;
       }
 
@@ -590,6 +624,7 @@
 
       const entityId = rowNode.dataset.rgEntity;
       if (tapPreference() === "yes") {
+        leaving();
         openEntity(entityId);
         return;
       }
@@ -821,13 +856,22 @@
 
   const BANNER_CLASS = "rg-banner";
   /*
-   * Home Assistant's own restart dialog carries the guard's verdict the moment
-   * you open it. A restart-required repair did not - it only spoke up once you
-   * pressed Submit, which is after the decision you wanted help with. This puts
-   * the same read-only verdict in the repair dialog as it opens. No buttons:
-   * it informs, and Submit still does the actual gating.
+   * Put the guard's verdict inside whatever dialog is open, as it opens.
+   *
+   * Home Assistant's own restart dialog carries it already. Nothing else did -
+   * a restart-required repair, and an update that reboots when it finishes,
+   * both only spoke up once you had committed, which is after the decision you
+   * wanted help with.
+   *
+   * There used to be a brief floating strip for this instead. It was worse in
+   * both directions: it appeared after the fact, and it disappeared on a timer,
+   * so the answer was gone by the time you looked for it. This is the same card
+   * the restart dialog shows, it arrives with the dialog, and it stays.
+   *
+   * Read-only. No buttons: it informs, and the dialog's own button still does
+   * the actual gating.
    */
-  function showRepairBanner() {
+  function showDialogBanner() {
     let tries = 0;
     const attach = () => {
       const host = openModalHost();
@@ -873,6 +917,10 @@
             head.textContent = view.title;
             body.innerHTML = view.body;
           }
+          // The rows carry the entity id wherever they are drawn, so the only
+          // thing that made them tappable in the restart dialog and dead
+          // everywhere else was nobody listening here.
+          bindTaps(alert || body);
         };
 
         host.prepend(card);
@@ -897,6 +945,53 @@
     attach();
   }
 
+  /**
+   * The entity a more-info dialog is currently showing, or "".
+   *
+   * The dialog element publishes it, so there is nothing to infer from the
+   * rendered contents - which is just as well, because those live several
+   * shadow roots deep and change shape between releases.
+   */
+  function openMoreInfoEntity() {
+    let found = "";
+    const walk = (node, depth) => {
+      if (found || depth > 8) return;
+      for (const el of node.querySelectorAll("*")) {
+        if (el.tagName.toLowerCase() === "ha-more-info-dialog") {
+          found = String(el._entityId || el.entityId || "");
+          return;
+        }
+        if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+      }
+    };
+    try {
+      walk(document, 0);
+    } catch (err) {
+      /* a banner is never worth breaking the page over */
+    }
+    return found;
+  }
+
+  /*
+   * An update dialog is a restart waiting to happen: core, OS and Supervisor
+   * updates all reboot when they finish. So it gets the verdict the moment it
+   * opens, the same as the restart dialog - not after Update is pressed, which
+   * is too late to be useful.
+   *
+   * Only when there is actually something to install. An update entity that is
+   * already up to date leads nowhere, and a banner on it would be noise.
+   */
+  function watchUpdateDialogs() {
+    setInterval(() => {
+      const entityId = openMoreInfoEntity();
+      if (!entityId.startsWith("update.")) return;
+      const hass = root() && root().hass;
+      const state = hass && hass.states[entityId];
+      if (!state || state.state !== "on") return;
+      showDialogBanner(); // no-ops if one is already in this dialog
+    }, TICK_MS);
+  }
+
   async function noteFixFlow(path, parameters, result) {
     if (!/^repairs\/issues\/fix\/?$/.test(String(path || ""))) return;
     const flowId = result && result.flow_id;
@@ -906,7 +1001,7 @@
     if (restartFlows.size > 32) {
       restartFlows.delete(restartFlows.values().next().value);
     }
-    showRepairBanner(); // say it now, not after they commit
+    showDialogBanner(); // say it now, not after they commit
   }
 
   function classifyApi(method, path) {
@@ -1274,6 +1369,10 @@
           head.textContent = view.title;
           body.innerHTML = html;
         }
+        // tapping a row here is not an answer to the question, so treat
+        // going to look at something as declining the restart
+        (alert || body).__rgOnLeave = () => close(false);
+        bindTaps(alert || body);
         // once it is clear, this stops being an override and becomes a go-ahead
         go.textContent = view.type === "error" ? action.confirm : action.proceed;
         go.classList.toggle("danger", view.type === "error");
@@ -1391,6 +1490,10 @@
       return true;
     }
     if (!info.warn) {
+      // Say so, in whatever dialog is open. This is what replaced the floating
+      // strip: no prompt at all would mean both "checked, nothing at risk" and
+      // "the guard never ran", which is exactly the doubt it exists to remove.
+      showDialogBanner();
       // One action is one decision. Without this the same restart is judged
       // again on its way down to the websocket, and says so a second time.
       allowOnce(action, HANDOFF_MS);
@@ -1621,6 +1724,8 @@
     // hass is replaced on every reconnect, so keep checking the hooks are on
     patchHass();
     setInterval(patchHass, 2000);
+    // an update dialog is a restart in waiting: give it the verdict on sight
+    watchUpdateDialogs();
 
     const existing = el.shadowRoot.querySelector(DIALOG_TAG);
     if (existing) manage(existing);
