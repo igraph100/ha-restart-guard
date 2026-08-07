@@ -854,6 +854,43 @@
     }
   }
 
+  /**
+   * Where inside a host dialog a card should actually go.
+   *
+   * The `<dialog>` and the white sheet you can see are the same box on a wide
+   * screen, so prepending to the dialog put the card neatly at the top of the
+   * sheet. On a phone they are not: the dialog fills the screen and the sheet
+   * is an inner element anchored to the bottom of it. A card prepended to the
+   * dialog then lands in the dimmed area *above* the sheet, floating over the
+   * page behind - which is where it was reported, and it looked broken.
+   *
+   * So aim for the sheet. Returns null when there isn't one *yet* - the dialog
+   * is built in stages and the sheet can arrive a frame or two after the
+   * `<dialog>` does, so the caller waits rather than falling back immediately.
+   * Falling back early is what puts the card in the dimmed area.
+   */
+  function cardSlot(host) {
+    if (!host) return null;
+    for (const selector of [".body", ".content", ".mdc-dialog__content"]) {
+      const inner = host.querySelector(selector);
+      if (inner) return inner;
+    }
+    return null;
+  }
+
+  /**
+   * The sheet if we can find one, the dialog itself once waiting has stopped
+   * being reasonable. Some dialogs genuinely have no inner surface, and a
+   * banner in an awkward place still beats no banner at all.
+   */
+  function cardSlotOrHost(host, graceLeft) {
+    return cardSlot(host) || (graceLeft <= 0 ? host : null);
+  }
+
+  // how many 150ms attempts to spend waiting for a sheet to appear before
+  // settling for the dialog itself - about a second and a half
+  const GRACE_TRIES = 10;
+
   const BANNER_CLASS = "rg-banner";
   /*
    * Put the guard's verdict inside whatever dialog is open, as it opens.
@@ -875,7 +912,12 @@
     let tries = 0;
     const attach = () => {
       const host = openModalHost();
-      if (!host) {
+      // Wait for the sheet, not just the dialog. On a phone the dialog is a
+      // transparent full-height drawer and the sheet arrives a moment later;
+      // attaching the instant the dialog exists put the card on the backdrop
+      // above it, over the page.
+      const slot = host && cardSlotOrHost(host, GRACE_TRIES - tries);
+      if (!slot) {
         if (++tries < 24) setTimeout(attach, 150); // dialog still rendering
         return;
       }
@@ -923,7 +965,7 @@
           bindTaps(alert || body);
         };
 
-        host.prepend(card);
+        slot.prepend(card);
         paint();
         host.addEventListener("close", stop);
         // same timing rule as everything else here: ha-alert has not rendered
@@ -1434,7 +1476,7 @@
         // the banner has said its piece; the prompt takes over from here
         const banner = host.querySelector("." + BANNER_CLASS);
         if (banner) banner.remove();
-        host.prepend(card);
+        (cardSlot(host) || host).prepend(card);
         paint();
         // Same timing trap as the note: when ha-alert carries the content, all
         // that measures on this tick is the button row - under the threshold -
