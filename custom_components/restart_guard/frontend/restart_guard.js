@@ -1302,8 +1302,36 @@
     return false;
   }
 
-  /** Resolves true to let the action through, false to cancel it. */
+  /*
+   * One question on screen at a time.
+   *
+   * Home Assistant's own button stays live while the prompt is up, so pressing
+   * it again asked the same question a second time and stacked a second card
+   * on top of the first. Every press after that added another, and each one
+   * had to be dismissed separately.
+   *
+   * A repeat press about the same kind of action gets handed the question
+   * that is already open, so it waits on the same answer instead of asking
+   * again. Scoped by action kind, because a restart and a core update are two
+   * different decisions and answering one must not answer the other.
+   */
+  let asking = { key: null, promise: null };
+
   function showConfirm(action) {
+    const key = (action && action.key) || "restart";
+    if (asking.promise && asking.key === key) return asking.promise;
+
+    const promise = askConfirm(action);
+    asking = { key: key, promise: promise };
+    const clear = () => {
+      if (asking.promise === promise) asking = { key: null, promise: null };
+    };
+    promise.then(clear, clear);
+    return promise;
+  }
+
+  /** Resolves true to let the action through, false to cancel it. */
+  function askConfirm(action) {
     return new Promise((resolve) => {
       modalStyle();
 
