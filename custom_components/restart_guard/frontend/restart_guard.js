@@ -75,17 +75,38 @@
       mins: isFinite(mins) ? mins : null,
       win: win,
       items: items,
-      // split at the warn window: what a restart threatens, and what is
-      // merely coming up later in the lookahead
-      atRisk: items.filter((item) => Number(item.minutes) <= win),
-      later: items.filter((item) => Number(item.minutes) > win),
+      /*
+       * Split at the warn window: what a restart threatens, and what is merely
+       * coming up later in the lookahead.
+       *
+       * A counting-down `for:` is always on the threatened side, however far
+       * off it looks. Home Assistant re-arms a clock trigger when it comes
+       * back, so a run due in twenty minutes is genuinely safe to restart
+       * through - but it never re-arms a `for:` countdown, because it only
+       * starts one when it *sees* the state change and a restart means it
+       * never saw it. That run is not delayed by restarting. It is cancelled.
+       */
+      atRisk: items.filter(
+        (item) => item.countdown === true || Number(item.minutes) <= win
+      ),
+      later: items.filter(
+        (item) => item.countdown !== true && Number(item.minutes) > win
+      ),
+      counting: items.filter((item) => item.countdown === true),
       count: count,
       lookahead: parseInt(attrs.lookahead, 10) || 60,
       error: attrs.error || null,
       // runs in progress right now: a restart cuts them off mid-way
       running: attrs.running || [],
-      dueSoon: count > 0 && isFinite(mins) && mins <= win,
-      clear: count > 0 && isFinite(mins) && mins > win,
+      dueSoon:
+        count > 0 &&
+        ((isFinite(mins) && mins <= win) ||
+          items.some((item) => item.countdown === true)),
+      clear:
+        count > 0 &&
+        isFinite(mins) &&
+        mins > win &&
+        !items.some((item) => item.countdown === true),
       // Anything part-way through a run is at risk, however long it has been
       // going. A three-hour delay is exactly the case a restart destroys, and
       // it used to read as safe simply for taking a while.
@@ -419,6 +440,22 @@
   }
 
   function describe(item) {
+    /*
+     * A counting-down `for:` gets the same treatment as a run in progress,
+     * because it is the same kind of loss. The countdown is ticking now and
+     * restarting throws it away - Home Assistant never re-arms one, so the run
+     * simply does not happen. Saying only "in 25 min" reads like an ordinary
+     * upcoming run, which is exactly the wrong impression.
+     */
+    if (item.countdown === true) {
+      return row(
+        trimKind(item.alias),
+        `${clockTime(item)} · ${relative(item.minutes)} — restarting cancels it`,
+        kindOf(item),
+        "rg-live",
+        item.entity_id
+      );
+    }
     return row(
       trimKind(item.alias),
       `${clockTime(item)} · ${relative(item.minutes)}`,
@@ -499,6 +536,7 @@
 
       // lead with the number that decides it: how long you have
       const midRun = info.running.length;
+      const counting = (info.counting || []).length;
       let title;
       if (midRun && info.dueSoon) {
         title = `Wait — something is running, next run ${relative(info.mins)}`;
@@ -507,6 +545,14 @@
           midRun,
           "Wait — an automation is running right now",
           "Wait — {n} automations are running right now"
+        );
+      } else if (counting) {
+        // not "next run in 25 min": that reads as something a restart merely
+        // delays, and this is one a restart cancels
+        title = plural(
+          counting,
+          "Wait — an automation is counting down right now",
+          "Wait — {n} automations are counting down right now"
         );
       } else {
         title = `Wait — next run ${relative(info.mins)}`;
@@ -519,7 +565,13 @@
             "wait or delay never happen."
         );
       }
-      if (info.dueSoon) {
+      if (counting) {
+        hints.push(
+          "A waiting `for:` countdown is thrown away by a restart and never " +
+            "resumes, so that run does not happen at all - not even late."
+        );
+      }
+      if (info.dueSoon && !counting) {
         hints.push(
           "A restart takes 30-90 seconds, and missed time triggers are not replayed."
         );

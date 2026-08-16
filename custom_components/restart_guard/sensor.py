@@ -275,6 +275,8 @@ class RestartGuardSensor(SensorEntity):
         self._predictions: dict[str, int] = {}
         self._prediction_log: list[dict[str, Any]] = []
         self._mirrors: dict[tuple[str, str], Any] | None = None
+        # timestamps of runs that are an armed `for:` countdown, not merely due
+        self._counting: set[int] = set()
         self._declares: dict[str, bool] = {}
 
     async def async_added_to_hass(self) -> None:
@@ -325,6 +327,9 @@ class RestartGuardSensor(SensorEntity):
             "running_count": len(self._running),
             # every run in progress blocks now, however long it has been going
             "blocking_runs": len(self._running),
+            # runs that a restart cancels rather than delays: an armed `for:`
+            # countdown is never re-armed, so restarting loses the run
+            "countdown_runs": sum(1 for i in self._items if i.get("countdown")),
             "warn_window": self._option(CONF_WARN_WINDOW, DEFAULT_WARN_WINDOW),
             "lookahead": self._option(CONF_LOOKAHEAD, DEFAULT_LOOKAHEAD),
             # read by the frontend module: may a row be tapped to open
@@ -371,6 +376,7 @@ class RestartGuardSensor(SensorEntity):
             self._prediction_log = []
             self._mirrors = None
             self._declares = {}
+            self._counting = set()
             self._running = self._collect_running(now)
         except Exception:  # noqa: BLE001 - never let this break the sensor
             _LOGGER.exception("Restart Guard could not read in-progress runs")
@@ -438,6 +444,21 @@ class RestartGuardSensor(SensorEntity):
                 _LOGGER.exception("Restart Guard could not read Scheduler schedules")
 
         self._error = None
+        # Flag the runs that a restart cancels outright rather than delays.
+        #
+        # A clock trigger is re-armed on the way back up, so a run due in
+        # twenty minutes survives a restart and needs no warning. An armed
+        # `for:` countdown is not re-armed - Home Assistant only starts one
+        # when it *sees* the state change, and a restart means it never saw it.
+        # So that run does not happen at all, however far away it looked.
+        #
+        # Matched on the timestamp alone. Two runs landing on the same second
+        # would tag the innocent one too, which costs a warning nobody needed -
+        # the same direction every other guess here errs in.
+        for item in items:
+            if item.get("at_ts") in self._counting:
+                item["countdown"] = True
+
         # Attributes are written to the recorder every time this updates, and
         # a day-long lookahead can turn up hundreds of runs. The banner shows
         # six, so carrying every one would cost database for nothing. `count`
@@ -950,7 +971,14 @@ class RestartGuardSensor(SensorEntity):
                 self._count_prediction("pending for")
                 # `last_changed` carries microseconds; every other prediction
                 # here is a whole second, and the banner shows minutes
-                return done.replace(microsecond=0)
+                finish = done.replace(microsecond=0)
+                # Remember that this one is a countdown already running, not a
+                # run that is merely due. The difference decides whether a
+                # restart is safe: Home Assistant re-arms a clock trigger after
+                # a restart, but it never re-arms a `for:` countdown, so this
+                # run is not delayed by restarting - it is lost.
+                self._counting.add(int(finish.timestamp()))
+                return finish
             if restored:
                 self._count_prediction("for: not armed")
 

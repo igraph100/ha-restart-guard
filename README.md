@@ -171,6 +171,15 @@ Conditions that need nothing from the house are exempt, because they're just as 
 tomorrow: `weekday`, and `condition: trigger`. An automation gated on Sunday, firing at
 00:01 on Monday, is ruled out on the day it lands on however far away it is.
 
+**A running `for:` countdown always warns**, however far off it is. Everything else on
+the banner is judged by how soon it is, because a restart only *delays* it — Home
+Assistant re-arms a clock trigger on the way back up, so a run due in twenty minutes
+still happens at twenty minutes. A `for:` countdown is not re-armed: Home Assistant only
+starts one when it *sees* the state change, and after a restart it never saw it. So
+restarting doesn't postpone that run, it cancels it — which makes distance irrelevant and
+puts it in the same class as an automation that's already mid-run. Those rows say
+*"restarting cancels it"* and are counted in `countdown_runs`.
+
 **When in doubt, it warns.** A wrong "safe to restart" costs you a real automation run,
 so anything that can't be judged confidently counts as *will run*:
 
@@ -266,6 +275,7 @@ against `9999`.
 | `skipped_count` | How many were skipped |
 | `running` | Runs in progress: `alias`, `entity_id`, `current`, `seconds_ago` |
 | `running_count` | How many are mid-run |
+| `countdown_runs` | How many upcoming runs are an armed `for:` countdown — a restart cancels these rather than delaying them |
 | `blocking_runs` | Same number as `running_count`. Every run in progress blocks, however long it has been going — kept as its own name because that is the question being asked |
 | `warn_window`, `lookahead` | Current options, read by the frontend module |
 | `open_on_tap`, `tap_answered`, `scheduler_path` | The tap settings, read by the frontend module. `tap_answered` is whether anyone has been asked yet |
@@ -309,7 +319,7 @@ card:
 | `time_pattern` | Unless it repeats more often than the min interval |
 | `sun` with `offset` | `sun.sun`'s own `next_rising` / `next_setting`, the same times the trigger is scheduled from |
 | `calendar` event start / end, with an offset | The calendar entity's own `start_time` / `end_time` |
-| `state` with `for:` | The countdown already running (`last_changed` + the delay), or the predicted change plus it — but only a countdown Home Assistant actually saw start, see below |
+| `state` with `for:` | The countdown already running (`last_changed` + the delay), or the predicted change plus it — but only a countdown Home Assistant actually saw start, see below. A running countdown always warns, see [When it stays quiet](#when-it-stays-quiet) |
 | `timer.*` finishing | The timer's own `finishes_at`, while it is running |
 | `state` on an `attribute:` | The same published windows, read for that attribute rather than the state |
 | `state` on an entity that publishes when it next changes | The entity's own window attributes, or times published by its integration — see [Predictable state changes](#predictable-state-changes) |
