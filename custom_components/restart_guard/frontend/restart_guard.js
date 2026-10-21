@@ -2094,5 +2094,5 @@
 
   attach();
   window.__restartGuardLoaded = true; // handy marker when debugging in DevTools
-  window.__restartGuardBuild = "0.0.4"; // which build the browser actually has
+  window.__restartGuardBuild = "0.1.0"; // which build the browser actually has
 })();
