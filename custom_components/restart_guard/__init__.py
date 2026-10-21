@@ -12,6 +12,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
 from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -119,7 +120,11 @@ def _register_services(hass: HomeAssistant, entry: ConfigEntry) -> None:
             },
         )
 
-    hass.services.async_register(
+    # Admin-only: the service rewrites the config entry's options, which is an
+    # admin's decision - and the prompt that calls it only appears in the
+    # update and restart dialogs, which only admins can open anyway.
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_SET_OPEN_ON_TAP,
         _set,
