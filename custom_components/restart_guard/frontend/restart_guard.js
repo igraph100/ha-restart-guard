@@ -12,6 +12,10 @@
  * up making, and asking for confirmation there instead. See "guarding the
  * rest" below.
  *
+ * And the File editor add-on's own Restart dialog, which restarts through the
+ * add-on's backend and so never touches any of those calls - see "file
+ * editor" below.
+ *
  * The integration registers this file automatically. Nothing to install by
  * hand, no /config/www copy, no extra_module_url entry.
  *
@@ -337,8 +341,12 @@
     const hass = root() && root().hass;
     if (!hass || !hass.callService) return;
     // nothing to do on failure: the prompt simply appears again next time,
-    // which is a better outcome than a preference that silently didn't save
-    hass.callService("restart_guard", "set_open_on_tap", { enabled: !!answer });
+    // which is a better outcome than a preference that silently didn't save.
+    // (The service is admin-only, so a non-admin's call is refused - caught
+    // here so it doesn't surface as an unhandled rejection.)
+    Promise.resolve(
+      hass.callService("restart_guard", "set_open_on_tap", { enabled: !!answer })
+    ).catch(() => {});
   }
 
   /** Where a row leads, or null if nothing sensible to open. */
@@ -1714,6 +1722,206 @@
     }
   }
 
+  // ---------------------------------------------------------- file editor
+  /*
+   * The File editor add-on (HASS Configurator) has its own "Restart" dialog,
+   * and it is invisible to everything above: the add-on runs in an ingress
+   * iframe, and its YES button calls the add-on's own `restart()`, which asks
+   * the add-on's *backend* to restart Home Assistant. No service call, no
+   * websocket message and no REST call ever leaves this frontend.
+   *
+   * What makes it reachable is that ingress serves the add-on from Home
+   * Assistant's own origin, so the iframe's window is ours to look into. So
+   * the same two things the native dialog gets are done there directly:
+   *
+   *   - the verdict card, inside the add-on's restart dialog while it is open;
+   *   - `restart()` wrapped, so YES goes through the same confirm prompt as
+   *     every other guarded restart when something is due or running.
+   *
+   * Recognised by what it has (a `#modal_restart` dialog and a global
+   * `restart` function), not by an add-on slug, which differs per install.
+   * Anything that does not look exactly like that is left alone.
+   */
+  const EDITOR_CARD = "rg-editor-card";
+  const EDITOR_CSS = `
+    .${EDITOR_CARD} {
+      display: block; margin: 0 0 16px; padding: 12px 16px;
+      border-radius: 10px; border: 1px solid transparent;
+      font-size: 14px; line-height: 1.5; color: inherit;
+    }
+    .${EDITOR_CARD}.error {
+      background: rgba(219, 68, 55, 0.12); border-color: rgba(219, 68, 55, 0.6);
+    }
+    .${EDITOR_CARD}.success {
+      background: rgba(67, 160, 71, 0.12); border-color: rgba(67, 160, 71, 0.45);
+    }
+    .${EDITOR_CARD} .rg-title { display: block; font-weight: 700; margin-bottom: 4px; }
+    .${EDITOR_CARD} .rg-line { display: block; }
+    .${EDITOR_CARD} .rg-hint { display: block; margin-top: 6px; opacity: 0.75; }
+    ${ROW_CSS}
+  `;
+
+  /** Every iframe in the app, through the shadow roots it is buried in. */
+  function appIframes() {
+    const found = [];
+    const walk = (scope, depth) => {
+      if (!scope || depth > 12) return;
+      for (const frame of scope.querySelectorAll("iframe")) found.push(frame);
+      for (const el of scope.querySelectorAll("*")) {
+        if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+      }
+    };
+    const el = root();
+    walk(el && el.shadowRoot, 0);
+    return found;
+  }
+
+  /** The add-on's window, if this iframe is a same-origin File editor. */
+  function editorWindow(frame) {
+    try {
+      const win = frame.contentWindow;
+      const doc = win && win.document; // throws for a cross-origin frame
+      if (!doc || typeof win.restart !== "function") return null;
+      return doc.getElementById("modal_restart") ? win : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function editorToast(win, text) {
+    try {
+      const toast =
+        (win.Materialize && win.Materialize.toast) || (win.M && win.M.toast);
+      if (!toast) return;
+      if (win.Materialize) win.Materialize.toast(text, 4000);
+      else win.M.toast({ html: text, displayLength: 4000 });
+    } catch (err) {
+      /* a missing toast is not worth an error */
+    }
+  }
+
+  function editorModalOpen(modal) {
+    try {
+      const view = modal.ownerDocument.defaultView;
+      const style = view.getComputedStyle(modal);
+      return style.display !== "none" && style.visibility !== "hidden";
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /** Wrap the add-on's restart(), once per page load of the add-on. */
+  function guardEditorRestart(win) {
+    if (win.restart.__rgWrapped) return;
+    const original = win.restart;
+    const wrapped = function (...args) {
+      const self = this;
+      shouldProceed(ACTIONS.restart).then(
+        (go) => {
+          if (go) return original.apply(self, args);
+          editorToast(win, ACTIONS.restart.cancelled);
+          return undefined;
+        },
+        // the guard failing is never a reason to refuse a restart
+        () => original.apply(self, args)
+      );
+    };
+    wrapped.__rgWrapped = true;
+    try {
+      win.restart = wrapped;
+    } catch (err) {
+      /* not writable: the add-on keeps its own behaviour */
+    }
+  }
+
+  /** Keep the verdict card in the add-on's restart dialog while it is open. */
+  function decorateEditorDialog(win) {
+    const doc = win.document;
+    const modal = doc.getElementById("modal_restart");
+    if (!modal) return;
+
+    const open = editorModalOpen(modal);
+    let card = modal.querySelector("." + EDITOR_CARD);
+
+    if (!open) {
+      if (card) card.remove();
+      modal.__rgSeenOpen = false;
+      return;
+    }
+    if (!modal.__rgSeenOpen) {
+      // just opened: ask for a fresh answer rather than one up to 30 s old
+      modal.__rgSeenOpen = true;
+      const info = guardInfo();
+      if (info && info.entityId) forceRefresh(info.entityId);
+    }
+
+    const view = describeState(guardInfo(), false);
+    if (!view) {
+      if (card) card.remove();
+      return;
+    }
+
+    if (!doc.getElementById("rg-editor-style")) {
+      const style = doc.createElement("style");
+      style.id = "rg-editor-style";
+      style.textContent = EDITOR_CSS;
+      (doc.head || doc.documentElement).appendChild(style);
+    }
+    if (!card) {
+      card = doc.createElement("div");
+      card.className = EDITOR_CARD;
+      // leaving to look at a row closes the add-on's dialog behind us
+      card.__rgOnLeave = () => {
+        try {
+          if (win.jQuery) win.jQuery(modal).modal("close");
+        } catch (err) {
+          /* it can stay open; the more-info dialog sits above it anyway */
+        }
+      };
+      bindTaps(card);
+      const content = modal.querySelector(".modal-content") || modal;
+      const heading = content.querySelector("h4, h5");
+      if (heading) heading.after(card);
+      else content.prepend(card);
+    }
+
+    const key = signature(view);
+    if (card.__rgKey === key) return;
+    card.__rgKey = key;
+    card.className = EDITOR_CARD + " " + view.type;
+    card.innerHTML =
+      `<span class="rg-title">${
+        view.type === "error" ? "&#9888;&#65039; " : "&#10003; "
+      }${esc(view.title)}</span>` + view.body;
+  }
+
+  function watchFileEditor() {
+    // Finding iframes means walking every shadow root in the app, so that is
+    // done every few seconds; repainting the dialog of one we already found is
+    // cheap and runs on the normal tick so the countdown stays live.
+    const RESCAN_EVERY = 4; // ticks, ~3 s
+    let frames = [];
+    let ticks = 0;
+    const scan = () => {
+      try {
+        if (ticks++ % RESCAN_EVERY === 0) frames = appIframes();
+        for (const frame of frames) {
+          if (!frame.isConnected) continue;
+          const win = editorWindow(frame);
+          if (!win) continue;
+          // the add-on reloads its page on navigation, which brings back an
+          // unwrapped restart(): checked on every tick, so it is re-wrapped
+          guardEditorRestart(win);
+          decorateEditorDialog(win);
+        }
+      } catch (err) {
+        /* never let the add-on hook disturb the rest */
+      }
+    };
+    setInterval(scan, TICK_MS);
+    scan();
+  }
+
   // ------------------------------------------------------- open detection
   /** The dialog body. Only present while the dialog is actually open. */
   function contentEl(host) {
@@ -1867,6 +2075,8 @@
     setInterval(patchHass, 2000);
     // an update dialog is a restart in waiting: give it the verdict on sight
     watchUpdateDialogs();
+    // the File editor add-on restarts from its own backend, out of sight
+    watchFileEditor();
 
     const existing = el.shadowRoot.querySelector(DIALOG_TAG);
     if (existing) manage(existing);
