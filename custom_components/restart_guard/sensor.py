@@ -252,6 +252,29 @@ class RestartGuardSensor(SensorEntity):
     _attr_native_unit_of_measurement = "min"
     _attr_should_poll = True
 
+    # Keep the bulky lists out of the database.
+    #
+    # The recorder refuses any attribute payload over 16 KB and says so in the
+    # log on every single state write - 114 times in a day and a half on one
+    # instance. An item is around 350 bytes, so roughly 46 upcoming runs is
+    # enough to cross it, which a long lookahead reaches easily.
+    #
+    # Nothing is lost that anyone looks at: the banner, templates and `count`
+    # all read the live attributes, which are unaffected. What the recorder
+    # would have stored is a minute-by-minute history of lists that are only
+    # ever read in the present tense. The scalars worth charting are still
+    # recorded.
+    _unrecorded_attributes = frozenset(
+        {
+            "items",
+            "skipped",
+            "running",
+            "state_debug",
+            "trigger_kinds",
+            "state_predictions",
+        }
+    )
+
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self._entry = entry
@@ -397,6 +420,7 @@ class RestartGuardSensor(SensorEntity):
                 self._attribute_change_next,
                 self._pending_for_next,
                 self._timer_finishes,
+                self._friendly_name,
             )
         except Exception as err:  # noqa: BLE001 - a bad automation must not kill the sensor
             _LOGGER.exception("Restart Guard could not work out the next run")
