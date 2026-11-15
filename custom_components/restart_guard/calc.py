@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -57,6 +58,96 @@ def trigger_kind(trigger: Any) -> str | None:
         return None
     kind = trigger.get("trigger") or trigger.get("platform")
     return str(kind) if kind else None
+
+
+def _plain_clock(value: Any) -> bool:
+    """A fixed wall-clock time like "20:00:00", as opposed to an entity."""
+    text = str(value or "")
+    return bool(re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", text))
+
+
+def _spoken_delay(seconds: int) -> str:
+    """"45 min" / "1 hr 5 min" - a delay said the way people say it."""
+    minutes = int(round(abs(seconds) / 60.0))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} hr {rest} min" if rest else f"{hours} hr"
+
+
+def describe_trigger(trigger: Any, resolve_name: Any = None) -> str | None:
+    """Which of an automation's triggers this is, in a few words.
+
+    Only ever shown on automations with more than one trigger, where the name
+    alone cannot say which one is about to fire. Two triggers on the same
+    entity differing only by their `for:` delay is the case that needs it most:
+    nothing else on the row tells them apart.
+
+    `None` means "say nothing", and that is the right answer more often than it
+    looks. A fixed clock time is already printed beside the row, so repeating
+    it as "at 8:00 PM" fills a line and adds nothing - an automation with four
+    timestamps is told apart by the time column on its own.
+
+    An `id:` wins whenever there is one. It is the author's own label, written
+    precisely because they needed to tell these triggers apart, and it is
+    almost always shorter than anything generated from the config.
+    """
+    if not isinstance(trigger, dict):
+        return None
+
+    given = trigger.get("id")
+    if given is not None and str(given).strip():
+        return str(given).strip()
+
+    kind = (trigger_kind(trigger) or "").lower()
+    name = resolve_name if callable(resolve_name) else (lambda value: str(value))
+
+    if kind == "time":
+        at = trigger_field(trigger, "at")
+        for value in as_list(at):
+            if is_entity_id(value):
+                return f"at {name(value)}"
+        return None  # a fixed time is already in the clock column
+
+    if kind == "time_pattern":
+        for unit, word in (("minutes", "min"), ("hours", "hr"), ("seconds", "s")):
+            raw = str(trigger_field(trigger, unit) or "")
+            if raw.startswith("/"):
+                return f"every {raw[1:]} {word}"
+            if raw and raw != "*":
+                return f"{word} {raw}"
+        return "repeating"
+
+    if kind == "sun":
+        event = str(trigger_field(trigger, "event") or "sun").lower()
+        offset = parse_offset(trigger_field(trigger, "offset"))
+        if not offset:
+            return event
+        sign = "+" if offset > 0 else "-"
+        return f"{event} {sign}{_spoken_delay(offset)}"
+
+    if kind in ("state", "numeric_state"):
+        entities = [e for e in as_list(trigger_field(trigger, "entity_id")) if e]
+        label = name(entities[0]) if entities else "an entity"
+        if len(entities) > 1:
+            label += f" +{len(entities) - 1}"
+        to_state = as_list(trigger_field(trigger, "to"))
+        moved = f"{label} turns {to_state[0]}" if to_state else f"{label} changes"
+        held = parse_offset(trigger_field(trigger, "for"))
+        return f"{moved}, after {_spoken_delay(held)}" if held else moved
+
+    if kind.startswith("calendar"):
+        ended = "ended" in kind or str(trigger_field(trigger, "event") or "") == "end"
+        return "a calendar event ends" if ended else "a calendar event starts"
+
+    if kind == "homeassistant":
+        event = str(trigger_field(trigger, "event") or "start").lower()
+        return "Home Assistant shuts down" if event == "shutdown" else "Home Assistant starts"
+
+    if kind == "template":
+        return "a template turns true"
+
+    return kind or None
 
 
 def trigger_field(trigger: Any, name: str) -> Any:
@@ -855,6 +946,7 @@ def compute(
     attribute_next: AttributeNext | None = None,
     pending_next: PendingNext | None = None,
     timer_next: TimerNext | None = None,
+    resolve_name: Any = None,
 ) -> list[dict[str, Any]]:
     """Upcoming runs inside the lookahead window, soonest first."""
     horizon = now + dt.timedelta(minutes=lookahead)
@@ -864,6 +956,12 @@ def compute(
     at_slot: dict[tuple[str, str], int] = {}
 
     for auto in automations:
+        # Which trigger fired is only worth saying when there is more than one
+        # to choose between. Counting the enabled ones, because a disabled
+        # trigger is not an alternative to anything.
+        live = [t for t in auto.triggers if is_enabled(t)]
+        say_trigger = len(live) > 1
+
         for index, trigger in enumerate(auto.triggers):
             if not is_enabled(trigger):
                 continue
@@ -904,7 +1002,7 @@ def compute(
                         ids.append(trigger_id)
                     continue
                 at_slot[key] = len(items)
-                items.append({
+                entry = {
                     "entity_id": auto.entity_id,
                     "alias": auto.name,
                     "at": slot.isoformat(),
@@ -915,7 +1013,12 @@ def compute(
                     "trigger_id": trigger_id,
                     "trigger_ids": [] if trigger_id is None else [trigger_id],
                     "trigger_index": index,
-                })
+                }
+                if say_trigger:
+                    text = describe_trigger(trigger, resolve_name)
+                    if text:
+                        entry["trigger_text"] = text
+                items.append(entry)
 
     items.sort(key=lambda item: item["minutes"])
     return items

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -36,9 +36,96 @@ class Verdict:
 
     will_run: bool
     reason: str | None = None
+    # every decision point on the way to the answer, so a run that should have
+    # been ruled out and wasn't can be read off the sensor instead of guessed at
+    trace: list[str] = field(default_factory=list)
 
 
 WILL_RUN = Verdict(True)
+
+
+# ---------------------------------------------------------------------------
+# Talking to Home Assistant's condition helper
+# ---------------------------------------------------------------------------
+# Conditions are built one at a time with the singular helpers, which are what
+# Home Assistant documents for custom integrations since 2026.5, and ANDed here.
+# The names moved over time, so they are resolved at run time rather than
+# imported: older cores have `async_from_config`, the documented name is
+# `async_condition_from_config`.
+def _helper(*names: str) -> Any:
+    for name in names:
+        found = getattr(condition_helper, name, None)
+        if found is not None:
+            return found
+    return None
+
+
+def _condition_schema() -> Any:
+    """Home Assistant's base condition schema, if this core has one."""
+    try:
+        from homeassistant.helpers import config_validation as cv
+    except Exception:  # noqa: BLE001 - not available outside Home Assistant
+        return None
+    return getattr(cv, "CONDITION_SCHEMA", None)
+
+
+async def _compile_one(hass: HomeAssistant, config: dict[str, Any]) -> Any:
+    """One validated, ready-to-check condition.
+
+    The configs come from `raw_config`, which is the YAML exactly as written:
+    a template is still a plain string there, and an `entity_id` a bare string
+    rather than a list. Two steps turn that into something checkable, and both
+    are needed.
+
+    The base schema comes first. It is what turns `value_template` text into a
+    compiled Template and `entity_id` into a list. `async_validate_condition_
+    config` does *not* do this - it assumes the schema has already run, because
+    for the automation's own `conditions:` block it has, inside the automation
+    integration. Skipping it left every branch template as raw text, the
+    checker raised on it, and "could not tell" read as "it runs": on one
+    instance a Lag BaOmer-only branch was reported as about to run every night.
+
+    Then the condition's own validation, for anything platform-specific.
+    """
+    schema = _condition_schema()
+    if schema is not None:
+        config = schema(config)
+    validate = _helper("async_validate_condition_config")
+    build = _helper("async_condition_from_config", "async_from_config")
+    if build is None:
+        raise RuntimeError("no condition factory in this Home Assistant")
+    validated = await validate(hass, config) if validate is not None else config
+    return await build(hass, validated)
+
+
+def _one_result(
+    checker: Any, variables: dict[str, Any], notes: list[str] | None = None
+) -> bool | None:
+    """Run a single condition. None means "could not tell".
+
+    Anything that goes wrong here used to vanish without a word, and "could not
+    tell" is read as "it runs" - so a failure looked exactly like a condition
+    that passed. Now it is written into the trace, and warned about.
+    """
+    kind = type(checker).__name__
+    try:
+        run = getattr(checker, "async_check", None)
+        result = run(variables=variables) if run is not None else checker(variables)
+    except Exception as err:  # noqa: BLE001 - missing trigger vars, template error, ...
+        if notes is not None:
+            notes.append(f"{kind} raised {type(err).__name__}: {err}")
+        _LOGGER.warning("Restart Guard: %s raised while checking", kind, exc_info=True)
+        return None
+    # A coroutine would be a future core making `async_check` truly async.
+    # Treating it as truthy would pass every condition, so refuse to guess.
+    if hasattr(result, "__await__"):
+        if notes is not None:
+            notes.append(f"{kind} returned a coroutine, not an answer")
+        return None
+    answer = bool(result) if result is not None else None
+    if notes is not None:
+        notes.append(f"{kind} -> {result!r}")
+    return answer
 
 
 def _configs_of(checker: Any) -> list[dict[str, Any]] | None:
@@ -156,6 +243,21 @@ class ConditionEvaluator:
         self._cache: dict[str, Any] = {}
         # (entity_id, moment) -> "does this entity change in between?"
         self._changes_before = changes_before
+        # what was seen while judging the current run; reset per verdict
+        self._notes: list[str] = []
+
+    def _note(self, text: str) -> None:
+        if len(self._notes) < 40:
+            self._notes.append(text)
+
+    def _runs(self, why: str) -> Verdict:
+        """'It will run', with the reason recorded rather than implied."""
+        self._note(f"=> runs: {why}")
+        return Verdict(True, None, list(self._notes))
+
+    def _not(self, why: str) -> Verdict:
+        self._note(f"=> ruled out: {why}")
+        return Verdict(False, why, list(self._notes))
 
     async def _checker(self, configs: list[dict[str, Any]]) -> Any | None:
         """Compile (and cache) a condition checker, or None if it won't compile.
@@ -170,17 +272,28 @@ class ConditionEvaluator:
         except (TypeError, ValueError):
             return None
         if key in self._cache:
-            return self._cache[key]
+            cached = self._cache[key]
+            self._note(
+                "compiled (cached): "
+                + (", ".join(type(one).__name__ for one in cached) if cached else "FAILED")
+            )
+            return cached
         try:
-            validated = await condition_helper.async_validate_conditions_config(
-                self._hass, configs
+            checker = [
+                await _compile_one(self._hass, config) for config in configs
+            ]
+        except Exception as err:  # noqa: BLE001 - unsupported shorthand, bad template, ...
+            self._note(f"compile failed: {type(err).__name__}: {err}")
+            _LOGGER.warning(
+                "Restart Guard could not compile the conditions %s, so it will "
+                "assume the run happens. This is worth reporting.",
+                configs, exc_info=True,
             )
-            checker = await condition_helper.async_conditions_from_config(
-                self._hass, validated, _LOGGER, "restart_guard"
-            )
-        except Exception:  # noqa: BLE001 - unsupported shorthand, bad template, ...
-            _LOGGER.debug("Could not compile conditions %s", configs, exc_info=True)
             checker = None
+        else:
+            self._note(
+                "compiled: " + ", ".join(type(one).__name__ for one in checker)
+            )
         self._cache[key] = checker
         return checker
 
@@ -205,13 +318,34 @@ class ConditionEvaluator:
         return True
 
     @staticmethod
-    def _check(checker: Any, variables: dict[str, Any] | None = None) -> bool | None:
-        """Run a compiled checker. None means "could not tell"."""
-        try:
-            result = checker.async_check(variables=variables or {})
-        except Exception:  # noqa: BLE001 - missing trigger vars, template error, ...
-            return None
-        return bool(result) if result is not None else None
+    def _check(
+        checker: Any,
+        variables: dict[str, Any] | None = None,
+        notes: list[str] | None = None,
+    ) -> bool | None:
+        """Run a checker. None means "could not tell".
+
+        Takes either our own list of conditions, which are ANDed here, or a
+        single checker - the automation's own compiled `conditions:` block,
+        which Home Assistant built and which ANDs them itself.
+
+        Three-valued, and the middle value is load-bearing. One condition that
+        definitely fails makes the whole block fail, however many others could
+        not be read; but if nothing fails and something was unreadable, the
+        honest answer is "do not know", which the caller treats as "it runs".
+        """
+        values = variables or {}
+        if not isinstance(checker, list):
+            return _one_result(checker, values, notes)
+
+        unknown = False
+        for one in checker:
+            result = _one_result(one, values, notes)
+            if result is False:
+                return False  # ANDed: one definite no settles it
+            if result is None:
+                unknown = True
+        return None if unknown else True
 
     def _volatile(self, node: Any, until: Any) -> bool:
         """Does any entity this condition names change before the run?
@@ -298,13 +432,19 @@ class ConditionEvaluator:
         now is a fair guess at how it will be then. Far-off runs are assumed to
         happen rather than judged on stale readings.
         """
+        self._notes = []
         raw = getattr(entity, "raw_config", None)
         raw = raw if isinstance(raw, dict) else {}
+        self._note(
+            f"trigger ids {self._item_trigger_ids(item)}; raw_config keys "
+            f"{sorted(raw)}; near={near}"
+        )
 
         # ---- 1. structural: can this trigger reach any branch at all? -------
         verdict = self._structural_verdict(raw, item)
         if verdict is not None:
-            return verdict
+            return self._not(verdict.reason or "structural")
+        self._note("structural: some branch is reachable")
 
         # ---- 1b. what the calendar alone settles --------------------------
         # Weekday and trigger-id conditions need nothing from the house, so
@@ -317,17 +457,19 @@ class ConditionEvaluator:
                 raw, set(self._item_trigger_ids(item)), dt_util.as_local(moment)
             )
             if settled is False:
-                return Verdict(False, "the day it falls on rules it out")
+                return self._not("the day it falls on rules it out")
+            self._note(f"date-certain: {settled}")
 
         # Anything below evaluates live state, which is only a fair proxy for
         # what will be true at the trigger time if the trigger time is close.
         if not near:
-            return WILL_RUN
+            return self._runs("too far ahead to judge on live state")
 
         # ---- 2. the automation's own conditions block -----------------------
         until = dt_util.parse_datetime(str(item.get("at") or ""))
         compiled = getattr(entity, "_condition", None)
         ours = self._item_trigger_ids(item)
+        self._note(f"top-level conditions: {type(compiled).__name__}")
         if compiled is not None:
             configs = _configs_of(compiled)
             judgeable = self._judgeable(configs, until) if configs else []
@@ -341,10 +483,11 @@ class ConditionEvaluator:
                 # only rule the run out if it fails for every trigger that
                 # could have fired it at this moment
                 if checker is not None and all(
-                    self._check(checker, self._trigger_variables(tid)) is False
+                    self._check(checker, self._trigger_variables(tid), self._notes)
+                    is False
                     for tid in (ours or [None])
                 ):
-                    return Verdict(False, "automation conditions are not met")
+                    return self._not("automation conditions are not met")
 
         # ---- 3. the conditions on whichever choose branches could match -----
         return await self._async_branch_verdict(raw, item, until)
@@ -388,9 +531,15 @@ class ConditionEvaluator:
         simply out of reach for it.
         """
         ours = self._item_trigger_ids(item)
-        blocks = _gate_blocks(raw.get("actions") or raw.get("action"))
+        actions = raw.get("actions") or raw.get("action")
+        blocks = _gate_blocks(actions)
         if blocks is None:
-            return WILL_RUN
+            steps = [s for s in as_list(actions) if isinstance(s, dict)]
+            return self._runs(
+                "a top-level step always acts: "
+                + ", ".join("+".join(sorted(s)) for s in steps[:6])
+            )
+        self._note(f"gates: {[len(o) for o in blocks]} branches")
 
         reachable = 0
         for options in blocks:
@@ -401,22 +550,28 @@ class ConditionEvaluator:
                 if ids and not matched:
                     continue  # this branch belongs to a different trigger
                 reachable += 1
+                label = option.get("alias") or f"branch {reachable}"
 
                 others = _strip_trigger_conditions(configs)
                 judgeable = self._judgeable(others, until)
+                self._note(
+                    f"{label}: ids {sorted(ids)}, {len(as_list(others))} other "
+                    f"condition(s), {len(judgeable)} judgeable"
+                )
                 if not judgeable:
-                    return WILL_RUN  # nothing here we could rule it out on
+                    return self._runs(f"{label}: nothing in it could be judged now")
                 checker = await self._checker(judgeable)
                 if checker is None:
-                    return WILL_RUN  # would not compile, so assume it runs
+                    return self._runs(f"{label}: its conditions would not compile")
                 # an ungated branch is reached by whichever trigger fired
                 candidates = sorted(matched) or (ours or [None])
-                if any(
-                    self._check(checker, self._trigger_variables(tid)) is not False
+                results = [
+                    self._check(checker, self._trigger_variables(tid), self._notes)
                     for tid in candidates
-                ):
-                    return WILL_RUN  # passes for some trigger, or could not tell
+                ]
+                if any(result is not False for result in results):
+                    return self._runs(f"{label}: checked {results}")
 
         if reachable == 0:
-            return Verdict(False, "no choose branch runs for this trigger")
-        return Verdict(False, "choose branch conditions are not met")
+            return self._not("no choose branch runs for this trigger")
+        return self._not("choose branch conditions are not met")

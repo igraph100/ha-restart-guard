@@ -272,6 +272,7 @@ class RestartGuardSensor(SensorEntity):
             "state_debug",
             "trigger_kinds",
             "state_predictions",
+            "condition_debug",
         }
     )
 
@@ -300,6 +301,7 @@ class RestartGuardSensor(SensorEntity):
         self._mirrors: dict[tuple[str, str], Any] | None = None
         # timestamps of runs that are an armed `for:` countdown, not merely due
         self._counting: set[int] = set()
+        self._condition_debug: list[dict[str, Any]] = []
         self._declares: dict[str, bool] = {}
 
     async def async_added_to_hass(self) -> None:
@@ -386,6 +388,8 @@ class RestartGuardSensor(SensorEntity):
             # attribute name, the value's type, the trigger's `to:`, or the
             # moment itself.
             "state_debug": self._prediction_log,
+            # why each run that was kept was not ruled out by its conditions
+            "condition_debug": self._condition_debug,
             "schedules_scanned": self._schedules_scanned,
             "schedule_conditions": self._schedule_source,
             "error": self._error,
@@ -400,6 +404,7 @@ class RestartGuardSensor(SensorEntity):
             self._mirrors = None
             self._declares = {}
             self._counting = set()
+            self._condition_debug = []
             self._running = self._collect_running(now)
         except Exception:  # noqa: BLE001 - never let this break the sensor
             _LOGGER.exception("Restart Guard could not read in-progress runs")
@@ -588,6 +593,18 @@ class RestartGuardSensor(SensorEntity):
             verdict = await self._conditions.async_verdict(entity, item, near)
             if verdict.will_run:
                 keep.append(item)
+                # Why this one was not ruled out. A run that should have been
+                # skipped and wasn't is otherwise invisible from the outside:
+                # "will run" looks the same whether the conditions passed or
+                # something failed on the way to finding out.
+                if len(self._condition_debug) < 10:
+                    self._condition_debug.append(
+                        {
+                            "alias": item.get("alias"),
+                            "at": item.get("when"),
+                            "trace": verdict.trace[-20:],
+                        }
+                    )
             else:
                 skipped.append({**item, "reason": verdict.reason})
         return keep, skipped
